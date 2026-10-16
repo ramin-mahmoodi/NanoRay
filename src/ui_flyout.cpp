@@ -54,6 +54,7 @@ static double           g_SpeedRxKB  = 0.0, g_SpeedTxKB = 0.0;
 
 static const UINT_PTR   IDT_ANIM     = 101;
 static const UINT_PTR   IDT_STATS    = 102;
+static const UINT_PTR   IDT_SAVE     = 103;
 static int              g_PressedBtn = 0;
 static float            g_SegPillX   = 25.0f;
 static float            g_SegTargetX = 25.0f;
@@ -1059,10 +1060,11 @@ static void render_flyout_graphics(Graphics& g, float scale, bool is_dark) {
         RectF r_paste_txt(r_p_uri.X + 24.0f, r_p_uri.Y, r_p_uri.Width - 28.0f, r_p_uri.Height);
         g.DrawString(L"Paste URI", -1, &f_btn, r_paste_txt, &sf_center, &sky_br);
 
-        if (g_cfg.vless_valid) {
-            draw_input_box(g, R_INP_VLESS_URI, FIELD_VLESS_URI, g_cfg.raw_vless_uri,
-                           L"vless:// or trojan:// URI", &f_mono, theme.uri, g_CharW, theme);
+        // Always draw input box so user can click, focus, and type manually even before a URI is valid
+        draw_input_box(g, R_INP_VLESS_URI, FIELD_VLESS_URI, g_cfg.raw_vless_uri,
+                       L"vless:// or trojan:// URI", &f_mono, theme.uri, g_CharW, theme);
 
+        if (g_cfg.vless_valid) {
             float curr_chip_x = 24.0f;
             // Chip 1: Protocol & Transport Badge
             std::wstring base_proto = (g_cfg.outbound_proto == PROTO_TROJAN) ? L"TROJAN" : L"VLESS";
@@ -1135,17 +1137,15 @@ static void render_flyout_graphics(Graphics& g, float scale, bool is_dark) {
                 g.DrawString(rem_str.c_str(), -1, &f_chip_rem, RectF(curr_chip_x, 327.5f, w3, 20.0f), &sf_center, &chip_txt_br);
             }
         } else {
-            Pen dash_pen(theme.dashed, 1.0f);
-            dash_pen.SetDashStyle(DashStyleDash);
-            GraphicsPath dash_path;
-            add_rounded_rect(dash_path, R_EMPTY_URI, 6.0f);
-            g.DrawPath(&dash_pen, &dash_path);
+            RectF r_hint(24.0f, 327.5f, 352.0f, 20.0f);
             if (g_cfg.chain_type != CHAIN_NONE && !g_cfg.chain_addr_str.empty()) {
                 std::wstring p_name = (g_cfg.chain_type == CHAIN_SOCKS5) ? L"SOCKS5" : L"HTTP";
                 std::wstring msg = L"Direct " + p_name + L" Proxy mode (No VLESS URI needed)";
-                g.DrawString(msg.c_str(), -1, &f_empty_msg, R_EMPTY_URI, &sf_center, &muted_br);
+                g.DrawString(msg.c_str(), -1, &f_empty_msg, r_hint, &sf_center, &muted_br);
+            } else if (g_cfg.raw_vless_uri.empty()) {
+                g.DrawString(L"Type or paste a VLESS or Trojan URI above", -1, &f_empty_msg, r_hint, &sf_center, &muted_br);
             } else {
-                g.DrawString(L"No server yet. Copy a VLESS or Trojan link, then Paste URI.", -1, &f_empty_msg, R_EMPTY_URI, &sf_center, &muted_br);
+                g.DrawString(L"Invalid or incomplete server URI", -1, &f_empty_msg, r_hint, &sf_center, &muted_br);
             }
         }
 
@@ -1424,6 +1424,9 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             }
         } else if (wParam == IDT_STATS) {
             update_flyout_stats();
+        } else if (wParam == IDT_SAVE) {
+            KillTimer(hwnd, IDT_SAVE);
+            save_config_ini();
         }
         return 0;
     case WM_REPAINT_FLYOUT:
@@ -1433,6 +1436,8 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         if (LOWORD(wParam) == WA_INACTIVE) {
             KillTimer(hwnd, IDT_ANIM);
             KillTimer(hwnd, IDT_STATS);
+            KillTimer(hwnd, IDT_SAVE);
+            save_config_ini();
             ShowWindow(hwnd, SW_HIDE);
             g_FocusField = FIELD_NONE;
             g_SelStart = g_SelEnd = 0;
@@ -1755,6 +1760,33 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             }
             return 0;
         }
+        if (ctrl && (wParam == 'X' || wParam == 'x')) {
+            if (g_SelStart != g_SelEnd) {
+                std::wstring w = to_wstr(*target);
+                int s_min = std::max(0, std::min(g_SelStart, g_SelEnd));
+                int s_max = std::min(static_cast<int>(w.size()), std::max(g_SelStart, g_SelEnd));
+                if (s_min < s_max) {
+                    std::wstring sub = w.substr(s_min, s_max - s_min);
+                    if (OpenClipboard(hwnd)) {
+                        EmptyClipboard();
+                        size_t bsz = (sub.size() + 1) * sizeof(wchar_t);
+                        HGLOBAL hGl = GlobalAlloc(GMEM_MOVEABLE, bsz);
+                        if (hGl) {
+                            memcpy(GlobalLock(hGl), sub.c_str(), bsz);
+                            GlobalUnlock(hGl);
+                            SetClipboardData(CF_UNICODETEXT, hGl);
+                        }
+                        CloseClipboard();
+                    }
+                    delete_selection(target);
+                    if (g_FocusField == FIELD_VLESS_URI) parse_vless_uri(*target); else sync_chain_fields();
+                    KillTimer(hwnd, IDT_SAVE);
+                    save_config_ini();
+                    update_layered_flyout();
+                }
+            }
+            return 0;
+        }
         if (ctrl && (wParam == 'A' || wParam == 'a')) {
             g_SelStart = 0;
             g_SelEnd = get_field_len(g_FocusField);
@@ -1814,11 +1846,25 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             update_layered_flyout();
             return 0;
         }
+        if (wParam == VK_DELETE) {
+            if (!delete_selection(target)) {
+                std::wstring w = to_wstr(*target);
+                if (g_CaretPos >= 0 && g_CaretPos < static_cast<int>(w.size())) {
+                    w.erase(g_CaretPos, 1);
+                    *target = to_utf8(w);
+                }
+            }
+            if (g_FocusField == FIELD_VLESS_URI) parse_vless_uri(*target); else sync_chain_fields();
+            SetTimer(hwnd, IDT_SAVE, 400, nullptr);
+            update_layered_flyout();
+            return 0;
+        }
         if (wParam == VK_RETURN || wParam == VK_ESCAPE) {
             g_FocusField = FIELD_NONE;
             g_SelStart = g_SelEnd = 0;
             parse_vless_uri(g_cfg.raw_vless_uri);
             sync_chain_fields();
+            KillTimer(hwnd, IDT_SAVE);
             save_config_ini();
             update_layered_flyout();
             return 0;
@@ -1845,6 +1891,8 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         } else if (wParam == VK_RETURN || wParam == VK_ESCAPE) {
             g_FocusField = FIELD_NONE;
             g_SelStart = g_SelEnd = 0;
+            KillTimer(hwnd, IDT_SAVE);
+            save_config_ini();
         } else if (wParam >= 32) {
             delete_selection(target);
             std::wstring w = to_wstr(*target);
@@ -1857,7 +1905,7 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             *target = to_utf8(w);
         }
         if (g_FocusField == FIELD_VLESS_URI) parse_vless_uri(*target); else sync_chain_fields();
-        save_config_ini();
+        SetTimer(hwnd, IDT_SAVE, 400, nullptr);
         update_layered_flyout();
         return 0;
     }

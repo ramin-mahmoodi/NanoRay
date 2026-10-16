@@ -124,7 +124,9 @@ bool parse_vless_uri(const std::string& uri_in) {
             if (eq != std::string::npos) {
                 std::string k = pair.substr(0, eq);
                 std::string v = url_decode(pair.substr(eq + 1));
-                if (k == "security" || k == "encryption") g_cfg.vless_security = v;
+                if (k == "security") g_cfg.vless_security = v;
+                else if (k == "encryption") g_cfg.vless_encryption = v;
+                else if (k == "allowInsecure") g_cfg.vless_allow_insecure = (v == "1" || v == "true");
                 else if (k == "packetEncoding") g_cfg.vless_packet_encoding = v;
                 else if (k == "sni") g_cfg.vless_sni = v;
                 else if (k == "alpn") g_cfg.vless_alpn = v;
@@ -235,7 +237,7 @@ void save_config_ini() {
 
 void load_config_ini() {
     std::string ini = get_ini_path();
-    char buf[1024]{};
+    char buf[8192]{};
     GetPrivateProfileStringA("VLESS", "URI", "", buf, sizeof(buf), ini.c_str());
     if (buf[0] != '\0') { g_cfg.raw_vless_uri = buf; parse_vless_uri(buf); }
     int ctype = GetPrivateProfileIntA("CHAIN", "Type", 0, ini.c_str());

@@ -15,6 +15,7 @@
 #include <ctime>
 #include <algorithm>
 #include <cctype>
+#include <mutex>
 #include "crypto_reality.h"
 #include "tls_fingerprint.h"
 
@@ -36,6 +37,9 @@ public:
         }
         return true;
     }
+
+    virtual ITransportStream* get_underlying() const { return nullptr; }
+    virtual void set_rcv_timeout(int /*timeout_ms*/) {}
 };
 
 // Plain TCP stream wrapping a standard SOCKET
@@ -70,6 +74,13 @@ public:
         }
     }
 
+    void set_rcv_timeout(int timeout_ms) override {
+        if (m_sock != INVALID_SOCKET) {
+            DWORD tv = static_cast<DWORD>(timeout_ms);
+            setsockopt(m_sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+        }
+    }
+
     SOCKET get_socket() const { return m_sock; }
 };
 
@@ -86,10 +97,12 @@ private:
 
     std::vector<uint8_t> m_enc_buf;
     std::vector<uint8_t> m_dec_queue;
+    bool              m_allow_insecure = false;
+    std::mutex        m_op_mtx;
 
 public:
-    SchannelStream(ITransportStream* underlying, const std::string& sni)
-        : m_underlying(underlying), m_sni(sni) {
+    SchannelStream(ITransportStream* underlying, const std::string& sni, bool allow_insecure = false)
+        : m_underlying(underlying), m_sni(sni), m_allow_insecure(allow_insecure) {
         std::memset(&m_hCred, 0, sizeof(m_hCred));
         std::memset(&m_hCtx, 0, sizeof(m_hCtx));
         std::memset(&m_sizes, 0, sizeof(m_sizes));
@@ -101,10 +114,16 @@ public:
     }
 
     bool handshake() {
+#ifndef SP_PROT_TLS1_3_CLIENT
+#define SP_PROT_TLS1_3_CLIENT 0x00002000
+#endif
         SCHANNEL_CRED sc{};
         sc.dwVersion = SCHANNEL_CRED_VERSION;
-        sc.grbitEnabledProtocols = SP_PROT_TLS1_2_CLIENT | 0x00000800; // TLS 1.2 or TLS 1.3
-        sc.dwFlags = SCH_CRED_NO_DEFAULT_CREDS | SCH_CRED_MANUAL_CRED_VALIDATION;
+        sc.grbitEnabledProtocols = SP_PROT_TLS1_2_CLIENT | SP_PROT_TLS1_3_CLIENT;
+        sc.dwFlags = SCH_CRED_NO_DEFAULT_CREDS;
+        if (m_allow_insecure) {
+            sc.dwFlags |= SCH_CRED_MANUAL_CRED_VALIDATION | SCH_CRED_IGNORE_NO_REVOCATION_CHECK | SCH_CRED_IGNORE_REVOCATION_OFFLINE;
+        }
 
         TimeStamp tsExpiry{};
         SECURITY_STATUS status = AcquireCredentialsHandleW(
@@ -229,7 +248,12 @@ public:
             buffers[3] = { 0, SECBUFFER_EMPTY, nullptr };
             SecBufferDesc desc{ SECBUFFER_VERSION, 4, buffers };
 
-            SECURITY_STATUS status = DecryptMessage(&m_hCtx, &desc, 0, nullptr);
+            SECURITY_STATUS status = SEC_E_INTERNAL_ERROR;
+            {
+                std::lock_guard<std::mutex> lk(m_op_mtx);
+                if (!m_ctx_valid) return -1;
+                status = DecryptMessage(&m_hCtx, &desc, 0, nullptr);
+            }
             if (status == SEC_E_INCOMPLETE_MESSAGE) {
                 uint8_t temp[16384];
                 int n = m_underlying->recv_some(temp, sizeof(temp));
@@ -274,6 +298,8 @@ public:
     }
 
     void close() override {
+        if (m_underlying) m_underlying->close();
+        std::lock_guard<std::mutex> lk(m_op_mtx);
         if (m_ctx_valid) {
             DeleteSecurityContext(&m_hCtx);
             m_ctx_valid = false;
@@ -282,7 +308,11 @@ public:
             FreeCredentialsHandle(&m_hCred);
             m_cred_valid = false;
         }
-        if (m_underlying) m_underlying->close();
+    }
+
+    ITransportStream* get_underlying() const override { return m_underlying; }
+    void set_rcv_timeout(int timeout_ms) override {
+        if (m_underlying) m_underlying->set_rcv_timeout(timeout_ms);
     }
 };
 
@@ -307,7 +337,7 @@ public:
         // Generate random 16-byte WebSocket Key
         static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         uint8_t nonce[16];
-        for (int i = 0; i < 16; ++i) nonce[i] = static_cast<uint8_t>(rand() & 0xFF);
+        reality::secure_random(nonce, 16);
         std::string ws_key;
         int val = 0, valb = -6;
         for (uint8_t c : nonce) {
@@ -362,8 +392,8 @@ public:
 
         // 4-byte random masking key
         uint8_t mask[4];
+        reality::secure_random(mask, 4);
         for (int i = 0; i < 4; ++i) {
-            mask[i] = static_cast<uint8_t>((rand() ^ (GetTickCount() >> (i * 8))) & 0xFF);
             frame.push_back(mask[i]);
         }
 
@@ -396,6 +426,8 @@ public:
                 payload_len = 0;
                 for (int i = 0; i < 8; ++i) payload_len = (payload_len << 8) | ext[i];
             }
+
+            if (payload_len > 16 * 1024 * 1024) return 0; // Defense against server bad_alloc crash
 
             uint8_t mask[4]{};
             if (masked) {
@@ -443,6 +475,11 @@ public:
     void close() override {
         if (m_underlying) m_underlying->close();
     }
+
+    ITransportStream* get_underlying() const override { return m_underlying; }
+    void set_rcv_timeout(int timeout_ms) override {
+        if (m_underlying) m_underlying->set_rcv_timeout(timeout_ms);
+    }
 };
 
 // HTTPUpgrade stream implementing HTTP/1.1 Upgrade without WebSocket frame overhead
@@ -466,7 +503,7 @@ public:
 
         static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         uint8_t nonce[16];
-        for (int i = 0; i < 16; ++i) nonce[i] = static_cast<uint8_t>(rand() & 0xFF);
+        reality::secure_random(nonce, 16);
         std::string ws_key;
         int val = 0, valb = -6;
         for (uint8_t c : nonce) {
@@ -512,6 +549,11 @@ public:
     void close() override {
         if (m_underlying) m_underlying->close();
     }
+
+    ITransportStream* get_underlying() const override { return m_underlying; }
+    void set_rcv_timeout(int timeout_ms) override {
+        if (m_underlying) m_underlying->set_rcv_timeout(timeout_ms);
+    }
 };
 
 // REALITY Stream implementing TLS 1.3 Client camouflage over raw TCP
@@ -524,10 +566,11 @@ private:
     std::string       m_spx;
     std::string       m_fp;
 
-    uint8_t m_client_write_key[16]{};
+    uint8_t m_client_write_key[32]{};
     uint8_t m_client_write_iv[12]{};
-    uint8_t m_server_write_key[16]{};
+    uint8_t m_server_write_key[32]{};
     uint8_t m_server_write_iv[12]{};
+    size_t  m_traffic_key_len = 16;
     uint64_t m_client_seq = 0;
     uint64_t m_server_seq = 0;
 
@@ -557,27 +600,27 @@ public:
         if (server_pub.size() != 32) return false;
         auto short_id = reality::hex_decode(m_sid);
 
-        // 1. Generate client random & ephemeral keys
+        // 1. Generate client random & ephemeral keys with cryptographically secure PRNG
         uint8_t client_random[32];
-        for (int i = 0; i < 32; ++i) client_random[i] = static_cast<uint8_t>(rand() & 0xFF);
+        reality::secure_random(client_random, 32);
 
         uint8_t client_priv[32], client_pub[32];
-        for (int i = 0; i < 32; ++i) client_priv[i] = static_cast<uint8_t>(rand() & 0xFF);
+        reality::secure_random(client_priv, 32);
         client_priv[0] &= 248; client_priv[31] &= 127; client_priv[31] |= 64;
         reality::x25519_base(client_pub, client_priv);
 
-        // 2. Derive AuthKey
+        // 2. Derive 32-byte AuthKey (matching Xray REALITY spec)
         uint8_t auth_shared[32];
         reality::x25519(auth_shared, client_priv, server_pub.data());
-        uint8_t auth_key[16];
-        reality::hkdf(client_random, 20, auth_shared, 32, "REALITY", 7, auth_key, 16);
+        uint8_t auth_key[32];
+        reality::hkdf(client_random, 20, auth_shared, 32, "REALITY", 7, auth_key, 32);
 
         // 3. Assemble authentic browser ClientHello via uTLS
         size_t sid_start = 0;
         utls::FingerprintProfile fp_prof = utls::parse_fp(m_fp);
         std::vector<uint8_t> hs = utls::build_browser_client_hello(fp_prof, m_sni, client_random, client_pub, sid_start);
 
-        // 4. Seal SessionId
+        // 4. Seal SessionId using AES-256-GCM with 32-byte AuthKey
         uint8_t plain_sid[16] = { 0x01, 0x08, 0x00, 0x00 };
         uint32_t now_ts = static_cast<uint32_t>(time(nullptr));
         plain_sid[4] = (now_ts >> 24) & 0xFF;
@@ -590,7 +633,7 @@ public:
 
         uint8_t ct[16]{}, tag[16]{};
         if (!reality::aes_gcm_encrypt(
-                auth_key, client_random + 20,
+                auth_key, 32, client_random + 20,
                 plain_sid, 16,
                 hs.data(), hs.size(),
                 ct, tag)) {
@@ -641,6 +684,9 @@ public:
         uint8_t sh_sid_len = sh[p++];
         if (sh.size() < p + sh_sid_len + 3) return false;
         p += sh_sid_len;
+        uint16_t cipher_suite = (sh[p] << 8) | sh[p + 1];
+        size_t traffic_key_len = (cipher_suite == 0x1302) ? 32 : 16;
+        m_traffic_key_len = traffic_key_len;
         p += 2; // cipher suite
         p += 1; // compression method
         if (sh.size() < p + 2) return false;
@@ -689,15 +735,15 @@ public:
         reality::derive_secret(handshake_secret, "c hs traffic", tr_hash1, client_hs_traffic);
         reality::derive_secret(handshake_secret, "s hs traffic", tr_hash1, server_hs_traffic);
 
-        uint8_t server_hs_key[16], server_hs_iv[12];
-        reality::hkdf_expand_label(server_hs_traffic, "key", nullptr, 0, server_hs_key, 16);
+        uint8_t server_hs_key[32], server_hs_iv[12];
+        reality::hkdf_expand_label(server_hs_traffic, "key", nullptr, 0, server_hs_key, traffic_key_len);
         reality::hkdf_expand_label(server_hs_traffic, "iv",  nullptr, 0, server_hs_iv, 12);
 
-        uint8_t client_hs_key[16], client_hs_iv[12];
-        reality::hkdf_expand_label(client_hs_traffic, "key", nullptr, 0, client_hs_key, 16);
+        uint8_t client_hs_key[32], client_hs_iv[12];
+        reality::hkdf_expand_label(client_hs_traffic, "key", nullptr, 0, client_hs_key, traffic_key_len);
         reality::hkdf_expand_label(client_hs_traffic, "iv",  nullptr, 0, client_hs_iv, 12);
 
-        // 8. Decrypt Server's Encrypted Handshake Records
+        // 8. Decrypt Server's Encrypted Handshake Records & Authenticate Server
         uint64_t s_hs_seq = 0;
         bool server_finished = false;
 
@@ -724,7 +770,7 @@ public:
             make_tls13_nonce(server_hs_iv, s_hs_seq++, nonce);
 
             if (!reality::aes_gcm_decrypt(
-                    server_hs_key, nonce,
+                    server_hs_key, traffic_key_len, nonce,
                     enc_buf.data(), ct_len,
                     tag_ptr,
                     enc_hdr, 5,
@@ -746,13 +792,70 @@ public:
                 size_t total_msg = 4 + msg_len;
                 if (idx + total_msg > dec.size()) break;
 
-                transcript.insert(transcript.end(), dec.begin() + idx, dec.begin() + idx + total_msg);
-                idx += total_msg;
+                // Server Authentication: Validate leaf certificate HMAC
+                if (msg_type == 0x0b) { // Certificate message
+                    size_t c_pos = idx + 4;
+                    if (c_pos < idx + total_msg) {
+                        uint8_t req_ctx_len = dec[c_pos++];
+                        c_pos += req_ctx_len;
+                        if (c_pos + 6 <= idx + total_msg) {
+                            c_pos += 3; // skip cert_list_len
+                            uint32_t cert_len = (dec[c_pos] << 16) | (dec[c_pos + 1] << 8) | dec[c_pos + 2];
+                            c_pos += 3;
+                            if (c_pos + cert_len <= idx + total_msg) {
+                                const uint8_t* cert_der = dec.data() + c_pos;
+                                bool cert_ok = false;
+                                for (size_t s = 0; s + 38 < cert_len; ++s) {
+                                    if (cert_der[s] == 0x2b && cert_der[s + 1] == 0x65 && cert_der[s + 2] == 0x70) {
+                                        for (size_t k = s + 3; k + 35 < cert_len && k < s + 20; ++k) {
+                                            if (cert_der[k] == 0x03 && cert_der[k + 1] == 0x21 && cert_der[k + 2] == 0x00) {
+                                                const uint8_t* pub = cert_der + k + 3;
+                                                if (cert_len >= 67) {
+                                                    size_t sig_pos = cert_len - 67;
+                                                    while (sig_pos > 0 && !(cert_der[sig_pos] == 0x03 && cert_der[sig_pos + 1] == 0x41 && cert_der[sig_pos + 2] == 0x00)) {
+                                                        sig_pos--;
+                                                    }
+                                                    if (cert_der[sig_pos] == 0x03 && cert_der[sig_pos + 1] == 0x41 && cert_der[sig_pos + 2] == 0x00) {
+                                                        const uint8_t* sig = cert_der + sig_pos + 3;
+                                                        uint8_t hmac_out[64];
+                                                        if (reality::hmac_sha512(auth_key, 32, pub, 32, hmac_out)) {
+                                                            if (std::memcmp(hmac_out, sig, 64) == 0) {
+                                                                cert_ok = true;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                                if (!cert_ok) return false;
+                            }
+                        }
+                    }
+                }
 
-                if (msg_type == 0x14) { // Finished
+                // Server Authentication: Validate server Finished message
+                if (msg_type == 0x14) { // Finished message
+                    uint8_t tr_hash_fin[32];
+                    reality::sha256(transcript.data(), transcript.size(), tr_hash_fin);
+                    uint8_t s_fin_key[32];
+                    reality::hkdf_expand_label(server_hs_traffic, "finished", nullptr, 0, s_fin_key, 32);
+                    uint8_t expected_fin[32];
+                    reality::hmac_sha256(s_fin_key, 32, tr_hash_fin, 32, expected_fin);
+                    if (msg_len < 32 || std::memcmp(dec.data() + idx + 4, expected_fin, 32) != 0) {
+                        return false;
+                    }
+                    transcript.insert(transcript.end(), dec.begin() + idx, dec.begin() + idx + total_msg);
+                    idx += total_msg;
                     server_finished = true;
                     break;
                 }
+
+                transcript.insert(transcript.end(), dec.begin() + idx, dec.begin() + idx + total_msg);
+                idx += total_msg;
             }
         }
 
@@ -770,9 +873,9 @@ public:
         reality::derive_secret(master_secret, "c ap traffic", tr_hash2, client_ap_traffic);
         reality::derive_secret(master_secret, "s ap traffic", tr_hash2, server_ap_traffic);
 
-        reality::hkdf_expand_label(client_ap_traffic, "key", nullptr, 0, m_client_write_key, 16);
+        reality::hkdf_expand_label(client_ap_traffic, "key", nullptr, 0, m_client_write_key, traffic_key_len);
         reality::hkdf_expand_label(client_ap_traffic, "iv",  nullptr, 0, m_client_write_iv, 12);
-        reality::hkdf_expand_label(server_ap_traffic, "key", nullptr, 0, m_server_write_key, 16);
+        reality::hkdf_expand_label(server_ap_traffic, "key", nullptr, 0, m_server_write_key, traffic_key_len);
         reality::hkdf_expand_label(server_ap_traffic, "iv",  nullptr, 0, m_server_write_iv, 12);
 
         // 10. Send Client Finished
@@ -797,7 +900,7 @@ public:
         uint8_t cfin_hdr[5] = { 0x17, 0x03, 0x03, static_cast<uint8_t>((cfin_rec_len >> 8) & 0xFF), static_cast<uint8_t>(cfin_rec_len & 0xFF) };
 
         if (!reality::aes_gcm_encrypt(
-                client_hs_key, cfin_nonce,
+                client_hs_key, traffic_key_len, cfin_nonce,
                 cfin.data(), cfin.size(),
                 cfin_hdr, 5,
                 cfin_ct.data(), cfin_tag)) {
@@ -834,7 +937,7 @@ public:
             std::vector<uint8_t> ct(pt.size());
             uint8_t tag[16];
             if (!reality::aes_gcm_encrypt(
-                    m_client_write_key, nonce,
+                    m_client_write_key, m_traffic_key_len, nonce,
                     pt.data(), pt.size(),
                     hdr, 5,
                     ct.data(), tag)) {
@@ -888,7 +991,7 @@ public:
             make_tls13_nonce(m_server_write_iv, m_server_seq++, nonce);
 
             if (!reality::aes_gcm_decrypt(
-                    m_server_write_key, nonce,
+                    m_server_write_key, m_traffic_key_len, nonce,
                     enc.data(), ct_len,
                     tag_ptr,
                     hdr, 5,
@@ -919,6 +1022,11 @@ public:
     void close() override {
         if (m_underlying) m_underlying->close();
     }
+
+    ITransportStream* get_underlying() const override { return m_underlying; }
+    void set_rcv_timeout(int timeout_ms) override {
+        if (m_underlying) m_underlying->set_rcv_timeout(timeout_ms);
+    }
 };
 
 // XHTTP / SplitHTTP stream implementing HTTP/1.1 chunked transport
@@ -945,9 +1053,7 @@ private:
 
     static std::string generate_session_id() {
         uint8_t rnd[8];
-        if (BCryptGenRandom(nullptr, rnd, sizeof(rnd), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
-            for (int i = 0; i < 8; ++i) rnd[i] = static_cast<uint8_t>((rand() ^ (GetTickCount() >> (i * 4))) & 0xFF);
-        }
+        reality::secure_random(rnd, sizeof(rnd));
         char buf[17];
         for (int i = 0; i < 8; ++i) {
             std::snprintf(buf + i * 2, 3, "%02x", rnd[i]);
@@ -959,12 +1065,17 @@ private:
     static std::string generate_padding(int min_len, int max_len) {
         if (min_len <= 0) min_len = 100;
         if (max_len < min_len) max_len = min_len;
-        int len = min_len + (rand() % (max_len - min_len + 1));
+        int len = min_len;
+        uint32_t r = 0;
+        reality::secure_random(&r, sizeof(r));
+        if (max_len > min_len) len += (r % (max_len - min_len + 1));
         static const char chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         std::string pad;
         pad.reserve(len);
+        std::vector<uint8_t> rnd_chars(len);
+        reality::secure_random(rnd_chars.data(), len);
         for (int i = 0; i < len; ++i) {
-            pad.push_back(chars[rand() % (sizeof(chars) - 1)]);
+            pad.push_back(chars[rnd_chars[i] % (sizeof(chars) - 1)]);
         }
         return pad;
     }
@@ -996,9 +1107,11 @@ public:
             "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
             "Content-Type: application/octet-stream\r\n"
             "Transfer-Encoding: chunked\r\n"
-            "X-Padding: " + padding + "\r\n"
-            "Connection: keep-alive\r\n"
-            "\r\n";
+            "X-Padding: " + padding + "\r\n";
+        if (!m_mode.empty() && m_mode != "auto") {
+            req += "X-Action: " + m_mode + "\r\n";
+        }
+        req += "Connection: keep-alive\r\n\r\n";
 
         return m_underlying->send_all(req.data(), static_cast<int>(req.size()));
     }
@@ -1189,6 +1302,11 @@ public:
             }
         }
     }
+
+    ITransportStream* get_underlying() const override { return m_underlying; }
+    void set_rcv_timeout(int timeout_ms) override {
+        if (m_underlying) m_underlying->set_rcv_timeout(timeout_ms);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -1209,7 +1327,10 @@ public:
         if (uuid) std::memcpy(m_uuid, uuid, 16);
     }
 
-    ~VisionStream() override { close(); }
+    ~VisionStream() override {
+        close();
+        delete m_underlying;
+    }
 
     bool send_all(const void* buf, int len) override {
         if (!m_underlying) return false;
@@ -1222,7 +1343,9 @@ public:
             uint16_t content_len = static_cast<uint16_t>(len);
 
             // Random padding between 128 and 384 bytes
-            uint16_t pad_len = 128 + static_cast<uint16_t>(rand() % 256);
+            uint8_t r_pad = 0;
+            reality::secure_random(&r_pad, 1);
+            uint16_t pad_len = 128 + static_cast<uint16_t>(r_pad);
             if (content_len + pad_len > 16384) {
                 pad_len = 32;
             }
@@ -1342,6 +1465,11 @@ public:
         if (m_underlying) {
             m_underlying->close();
         }
+    }
+
+    ITransportStream* get_underlying() const override { return m_underlying; }
+    void set_rcv_timeout(int timeout_ms) override {
+        if (m_underlying) m_underlying->set_rcv_timeout(timeout_ms);
     }
 };
 

@@ -292,10 +292,14 @@ static inline void x25519_base(uint8_t out[32], const uint8_t secret[32]) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. AES-128-GCM (via Windows CNG / bcrypt.dll)
+// 4. Cryptographic PRNG & AES-GCM (128 & 256) & HMAC-SHA512 (via CNG)
 // ---------------------------------------------------------------------------
+static inline void secure_random(void* buf, size_t len) {
+    BCryptGenRandom(nullptr, static_cast<PUCHAR>(buf), static_cast<ULONG>(len), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+}
+
 static inline bool aes_gcm_encrypt(
-    const uint8_t key[16], const uint8_t nonce[12],
+    const uint8_t* key, size_t key_len, const uint8_t nonce[12],
     const uint8_t* plaintext, size_t pt_len,
     const uint8_t* aad, size_t aad_len,
     uint8_t* ciphertext, uint8_t tag[16]) {
@@ -308,7 +312,7 @@ static inline bool aes_gcm_encrypt(
     if (status < 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
 
     BCRYPT_KEY_HANDLE hKey = nullptr;
-    status = BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0, (PUCHAR)key, 16, 0);
+    status = BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0, (PUCHAR)key, (ULONG)key_len, 0);
     if (status < 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
 
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
@@ -330,7 +334,7 @@ static inline bool aes_gcm_encrypt(
 }
 
 static inline bool aes_gcm_decrypt(
-    const uint8_t key[16], const uint8_t nonce[12],
+    const uint8_t* key, size_t key_len, const uint8_t nonce[12],
     const uint8_t* ciphertext, size_t ct_len,
     const uint8_t tag[16],
     const uint8_t* aad, size_t aad_len,
@@ -344,7 +348,7 @@ static inline bool aes_gcm_decrypt(
     if (status < 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
 
     BCRYPT_KEY_HANDLE hKey = nullptr;
-    status = BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0, (PUCHAR)key, 16, 0);
+    status = BCryptGenerateSymmetricKey(hAlg, &hKey, nullptr, 0, (PUCHAR)key, (ULONG)key_len, 0);
     if (status < 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
 
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
@@ -363,6 +367,20 @@ static inline bool aes_gcm_decrypt(
     BCryptDestroyKey(hKey);
     BCryptCloseAlgorithmProvider(hAlg, 0);
     return (status >= 0);
+}
+
+static inline bool hmac_sha512(const uint8_t* key, size_t key_len, const uint8_t* data, size_t data_len, uint8_t out[64]) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    NTSTATUS st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA512_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+    if (st < 0) return false;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    st = BCryptCreateHash(hAlg, &hHash, nullptr, 0, (PUCHAR)key, (ULONG)key_len, 0);
+    if (st < 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
+    BCryptHashData(hHash, (PUCHAR)data, (ULONG)data_len, 0);
+    BCryptFinishHash(hHash, out, 64, 0);
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return true;
 }
 
 // ---------------------------------------------------------------------------

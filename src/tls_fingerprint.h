@@ -186,16 +186,19 @@ static inline std::vector<uint8_t> build_browser_client_hello(
         add_ext(0x0012, nullptr, 0);
 
         // 12. Key Share (0x0033): GREASE + X25519
+        std::vector<uint8_t> ks_entries;
+        // GREASE key share (5 bytes)
+        ks_entries.push_back((grease_ext2 >> 8) & 0xFF); ks_entries.push_back(grease_ext2 & 0xFF);
+        ks_entries.push_back(0x00); ks_entries.push_back(0x01); ks_entries.push_back(0x00);
+        // X25519 key share (36 bytes)
+        ks_entries.push_back(0x00); ks_entries.push_back(0x1d);
+        ks_entries.push_back(0x00); ks_entries.push_back(0x20);
+        ks_entries.insert(ks_entries.end(), client_x25519_pub, client_x25519_pub + 32);
+
         std::vector<uint8_t> ks;
-        uint16_t ks_list_len = 2 + 4 + 4 + 32;
+        uint16_t ks_list_len = static_cast<uint16_t>(ks_entries.size());
         ks.push_back((ks_list_len >> 8) & 0xFF); ks.push_back(ks_list_len & 0xFF);
-        // GREASE key share
-        ks.push_back((grease_ext2 >> 8) & 0xFF); ks.push_back(grease_ext2 & 0xFF);
-        ks.push_back(0x00); ks.push_back(0x01); ks.push_back(0x00);
-        // X25519 key share
-        ks.push_back(0x00); ks.push_back(0x1d);
-        ks.push_back(0x00); ks.push_back(0x20);
-        ks.insert(ks.end(), client_x25519_pub, client_x25519_pub + 32);
+        ks.insert(ks.end(), ks_entries.begin(), ks_entries.end());
         add_ext(0x0033, ks.data(), ks.size());
 
         // 13. PSK Key Exchange Modes (0x002d)

@@ -17,9 +17,12 @@ struct AppConfig {
     std::string   trojan_hash_hex = "";
 
     // Advanced VLESS attributes
-    std::string vless_security = "none";
-    std::string vless_sni      = "";
-    std::string vless_alpn     = "";
+    std::string vless_security   = "none";
+    std::string vless_encryption = "none";
+    bool        vless_allow_insecure = false;
+    std::string vless_resolved_ip = "";
+    std::string vless_sni        = "";
+    std::string vless_alpn       = "";
     std::string vless_type     = "tcp";
     std::string vless_path     = "/";
     std::string vless_host     = "";

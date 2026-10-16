@@ -1397,6 +1397,20 @@ void update_flyout_stats() {
     }
 }
 
+static void hide_tray_flyout(HWND hwnd) {
+    if (!hwnd || !IsWindowVisible(hwnd)) return;
+    KillTimer(hwnd, IDT_ANIM);
+    KillTimer(hwnd, IDT_STATS);
+    KillTimer(hwnd, IDT_SAVE);
+    save_config_ini();
+    ShowWindow(hwnd, SW_HIDE);
+    g_FocusField = FIELD_NONE;
+    g_SelStart = g_SelEnd = 0;
+    g_PressedBtn = 0;
+    EmptyWorkingSet(GetCurrentProcess());
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+}
+
 static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE:
@@ -1436,16 +1450,7 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         return 0;
     case WM_ACTIVATE:
         if (LOWORD(wParam) == WA_INACTIVE) {
-            KillTimer(hwnd, IDT_ANIM);
-            KillTimer(hwnd, IDT_STATS);
-            KillTimer(hwnd, IDT_SAVE);
-            save_config_ini();
-            ShowWindow(hwnd, SW_HIDE);
-            g_FocusField = FIELD_NONE;
-            g_SelStart = g_SelEnd = 0;
-            g_PressedBtn = 0;
-            EmptyWorkingSet(GetCurrentProcess());
-            SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+            hide_tray_flyout(hwnd);
         }
         return 0;
     case WM_SETCURSOR: {
@@ -1929,7 +1934,7 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     }
     case WM_TRAYICON:
         if (lParam == WM_LBUTTONUP || lParam == WM_RBUTTONUP) {
-            if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE); else show_tray_flyout();
+            if (IsWindowVisible(hwnd)) hide_tray_flyout(hwnd); else show_tray_flyout();
         }
         return 0;
     case WM_DESTROY:

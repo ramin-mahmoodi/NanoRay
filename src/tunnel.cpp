@@ -649,10 +649,26 @@ static unsigned __stdcall tcp_session_thread(void* arg) {
     bool is_vless_downlink = (g_active_cfg.vless_valid && g_active_cfg.outbound_proto == PROTO_VLESS);
     uintptr_t hDown = _beginthreadex(nullptr, 65536, downlink_worker, new PipeStreamArgs{ stream, c_sock, is_vless_downlink }, 0, nullptr);
 
+    DWORD tv_c = 2000;
+    setsockopt(c_sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_c), sizeof(tv_c));
+
     char buf[65536];
+    ULONGLONG last_act = GetTickCount64();
     while (g_TunnelRun) {
         int n = recv(c_sock, buf, sizeof(buf), 0);
-        if (n <= 0) break;
+        if (n <= 0) {
+            if (n < 0 && WSAGetLastError() == WSAETIMEDOUT) {
+                if (hDown && WaitForSingleObject(reinterpret_cast<HANDLE>(hDown), 0) == WAIT_OBJECT_0) {
+                    break;
+                }
+                if (GetTickCount64() - last_act >= 120000) {
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        last_act = GetTickCount64();
         g_TotalTx += n;
         if (!stream->send_all(buf, n)) break;
     }
@@ -743,6 +759,7 @@ static unsigned __stdcall dns_hijack_worker(void* arg) {
     }
 
     if (stream) {
+        stream->set_rcv_timeout(3500);
         uint8_t pkt[2048];
         int offset = 0;
         if (g_active_cfg.vless_valid) {
@@ -925,7 +942,7 @@ static unsigned __stdcall udp_session_worker(void* arg) {
         if (g_active_cfg.outbound_proto == PROTO_TROJAN) {
             uint8_t atyp = 0;
             if (!v_stream->recv_exact(&atyp, 1)) {
-                if (WSAGetLastError() == WSAETIMEDOUT && (GetTickCount64() - sess->last_tick < 30000)) continue;
+                if (WSAGetLastError() == WSAETIMEDOUT && (GetTickCount64() - sess->last_tick < 12000)) continue;
                 break;
             }
             if (atyp == 0x01) { // IPv4
@@ -959,7 +976,7 @@ static unsigned __stdcall udp_session_worker(void* arg) {
         } else {
             uint8_t len_bytes[2];
             if (!v_stream->recv_exact(len_bytes, 2)) {
-                if (WSAGetLastError() == WSAETIMEDOUT && (GetTickCount64() - sess->last_tick < 30000)) continue;
+                if (WSAGetLastError() == WSAETIMEDOUT && (GetTickCount64() - sess->last_tick < 12000)) continue;
                 break;
             }
             dlen = (static_cast<uint16_t>(len_bytes[0]) << 8) | len_bytes[1];
@@ -1022,10 +1039,11 @@ static void handle_udp_packet(uint16_t src_port_net, uint32_t dst_ip, uint16_t d
     {
         std::lock_guard<std::mutex> lk(g_udp_table_mtx);
         static ULONGLONG s_last_reap = 0;
-        if (now - s_last_reap >= 5000) {
+        if (now - s_last_reap >= 3000) {
             s_last_reap = now;
+            ULONGLONG timeout_thresh = (g_udp_map.size() > 40) ? 5000 : 12000;
             for (auto it = g_udp_map.begin(); it != g_udp_map.end(); ) {
-                if (!it->second->alive.load() || (now - it->second->last_tick >= 30000)) {
+                if (!it->second->alive.load() || (now - it->second->last_tick >= timeout_thresh)) {
                     it->second->alive.store(false);
                     if (it->second->v_stream) it->second->v_stream->close();
                     it = g_udp_map.erase(it);

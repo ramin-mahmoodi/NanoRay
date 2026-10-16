@@ -19,26 +19,31 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure CMake
-        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+      - name: Set up MinGW (x64)
+        uses: egor-tensin/setup-mingw@v2
+        with:
+          platform: x64
 
-      - name: Build NanoRay
-        run: cmake --build build --config Release
+      - name: Compile Windows Resources
+        run: windres resources/resource.rc -O coff -o resource.o
+
+      - name: Build NanoRay (Pure C++ / MinGW)
+        run: g++ -O3 -s -std=c++17 -D_WIN32_WINNT=0x0A00 -DNOMINMAX -Isrc src/main.cpp src/config.cpp src/tunnel.cpp src/ui_flyout.cpp resource.o -o NanoRay.exe -lws2_32 -liphlpapi -lgdiplus -ldwmapi -lshell32 -lpsapi -lole32 -lgdi32 -luser32 -lwinhttp -lsecur32 -lcrypt32 -lbcrypt -mwindows
 
       - name: Download official signed Wintun driver (x64)
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile "wintun.zip"
           Expand-Archive -Path "wintun.zip" -DestinationPath "wintun_tmp"
-          Copy-Item "wintun_tmp/wintun/bin/amd64/wintun.dll" -Destination "build/Release/wintun.dll"
+          Copy-Item "wintun_tmp/wintun/bin/amd64/wintun.dll" -Destination "wintun.dll"
           Remove-Item "wintun.zip", "wintun_tmp" -Recurse -Force
 
       - name: Package Release
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path "dist" -Force
-          Copy-Item "build/Release/NanoRay.exe" -Destination "dist/"
-          Copy-Item "build/Release/wintun.dll" -Destination "dist/"
+          Copy-Item "NanoRay.exe" -Destination "dist/"
+          Copy-Item "wintun.dll" -Destination "dist/"
           Copy-Item "README.md" -Destination "dist/"
           Compress-Archive -Path "dist/*" -DestinationPath "NanoRay-windows-x64.zip"
 

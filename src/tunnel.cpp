@@ -185,7 +185,25 @@ std::atomic<uint64_t>    g_TotalRx{ 0 };
 std::atomic<uint64_t>    g_TotalTx{ 0 };
 std::atomic<int>         g_LastPingMs{ PING_IDLE };
 ULONGLONG                g_ConnectTick = 0;
-std::string              g_StatusMsg   = "Ready - Paste a VLESS URI to start";
+static std::mutex g_status_mtx;
+static std::string g_StatusMsg = "Ready - Paste a VLESS URI to start";
+
+void set_status_msg(const std::string& msg) {
+    std::lock_guard<std::mutex> lk(g_status_mtx);
+    g_StatusMsg = msg;
+}
+
+std::string get_status_msg() {
+    std::lock_guard<std::mutex> lk(g_status_mtx);
+    return g_StatusMsg;
+}
+
+static std::string mask_ip(uint32_t ip_net) {
+    uint32_t h = ntohl(ip_net);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%u.%u.x.x", (h >> 24) & 0xFF, (h >> 16) & 0xFF);
+    return buf;
+}
 
 static void log_msg(const char* fmt, ...) {
     static std::mutex log_mtx;
@@ -362,6 +380,8 @@ static SOCKET create_outbound_socket(const char* target_ip, uint16_t target_port
     if (ip_addr == INADDR_NONE) {
         if (!g_cfg.vless_resolved_ip.empty() && target_ip == g_cfg.vless_ip) {
             ip_addr = inet_addr(g_cfg.vless_resolved_ip.c_str());
+        } else if (!g_cfg.chain_resolved_ip.empty() && target_ip == g_cfg.chain_ip) {
+            ip_addr = inet_addr(g_cfg.chain_resolved_ip.c_str());
         }
     }
     if (ip_addr == INADDR_NONE) {
@@ -461,7 +481,7 @@ static SOCKET dial_vless_tunnel() {
     return dial_proxy_to_dest(vip, vport);
 }
 
-static ITransportStream* dial_vless_transport() {
+static ITransportStream* dial_vless_transport(bool enable_vision = false) {
     if (!g_cfg.vless_valid) return nullptr;
     SOCKET s = dial_vless_tunnel();
     if (s == INVALID_SOCKET) return nullptr;
@@ -520,7 +540,7 @@ static ITransportStream* dial_vless_transport() {
         stream = hu;
     }
 
-    if (g_cfg.vless_flow == "xtls-rprx-vision") {
+    if (enable_vision && g_cfg.outbound_proto == PROTO_VLESS && g_cfg.vless_flow == "xtls-rprx-vision") {
         stream = new VisionStream(stream, g_cfg.vless_uuid);
     }
 
@@ -539,7 +559,7 @@ static unsigned __stdcall downlink_worker(void* arg) {
     delete p;
 
     if (is_vless) {
-        ITransportStream* raw = v_stream->get_underlying() ? v_stream->get_underlying() : v_stream;
+        ITransportStream* raw = v_stream->unwrap_vision();
         uint8_t vless_resp[2];
         if (!raw->recv_exact(vless_resp, 2)) {
             shutdown(c_sock, SD_BOTH);
@@ -576,7 +596,7 @@ static unsigned __stdcall tcp_session_thread(void* arg) {
 
     ITransportStream* stream = nullptr;
     if (g_cfg.vless_valid) {
-        stream = dial_vless_transport();
+        stream = dial_vless_transport(g_cfg.outbound_proto == PROTO_VLESS && g_cfg.vless_flow == "xtls-rprx-vision");
     } else if (g_cfg.chain_type != CHAIN_NONE) {
         SOCKET p_sock = dial_proxy_to_dest(dst_ip, dst_port);
         if (p_sock != INVALID_SOCKET) {
@@ -611,7 +631,7 @@ static unsigned __stdcall tcp_session_thread(void* arg) {
                 if (r > 0) { initial_payload = r; g_TotalTx += r; }
             }
         }
-        ITransportStream* raw = stream->get_underlying() ? stream->get_underlying() : stream;
+        ITransportStream* raw = stream->unwrap_vision();
         if (!raw->send_all(first_pkt, hdr_len)) { delete stream; closesocket(c_sock); return 0; }
         if (initial_payload > 0) {
             if (!stream->send_all(first_pkt + hdr_len, initial_payload)) { delete stream; closesocket(c_sock); return 0; }
@@ -628,11 +648,15 @@ static unsigned __stdcall tcp_session_thread(void* arg) {
         g_TotalTx += n;
         if (!stream->send_all(buf, n)) break;
     }
-    // TCP Half-close: stop client receives but keep connection open so downlink can finish delivering
+    // TCP Half-close: signal upstream send shutdown and stop local receives
+    stream->shutdown_send();
     shutdown(c_sock, SD_RECEIVE);
 
     if (hDown) {
-        WaitForSingleObject(reinterpret_cast<HANDLE>(hDown), 10000);
+        while (g_TunnelRun) {
+            DWORD wr = WaitForSingleObject(reinterpret_cast<HANDLE>(hDown), 1000);
+            if (wr == WAIT_OBJECT_0) break;
+        }
         CloseHandle(reinterpret_cast<HANDLE>(hDown));
     }
     stream->close();
@@ -811,14 +835,15 @@ static unsigned __stdcall udp_session_worker(void* arg) {
     std::vector<uint8_t> first_data = std::move(args->first_payload);
     delete args;
 
-    ITransportStream* v_stream = dial_vless_transport();
+    ITransportStream* v_stream = dial_vless_transport(false);
     if (!v_stream) {
         sess->alive.store(false);
         std::lock_guard<std::mutex> lk(g_udp_table_mtx);
-        g_udp_map.erase(sess->session_key);
+        auto it = g_udp_map.find(sess->session_key);
+        if (it != g_udp_map.end() && it->second == sess) g_udp_map.erase(it);
         return 0;
     }
-    v_stream->set_rcv_timeout(30000); // 30s receive timeout to prevent worker thread leak
+    v_stream->set_rcv_timeout(2000); // 2s receive timeout to check session expiration without cutting active uploads
 
     std::vector<uint8_t> init_pkt;
     if (g_cfg.outbound_proto == PROTO_TROJAN) {
@@ -847,7 +872,8 @@ static unsigned __stdcall udp_session_worker(void* arg) {
             delete v_stream;
             sess->v_stream = nullptr;
             std::lock_guard<std::mutex> lk2(g_udp_table_mtx);
-            g_udp_map.erase(sess->session_key);
+            auto it = g_udp_map.find(sess->session_key);
+            if (it != g_udp_map.end() && it->second == sess) g_udp_map.erase(it);
             return 0;
         }
     }
@@ -859,7 +885,8 @@ static unsigned __stdcall udp_session_worker(void* arg) {
             delete v_stream;
             sess->v_stream = nullptr;
             std::lock_guard<std::mutex> lk2(g_udp_table_mtx);
-            g_udp_map.erase(sess->session_key);
+            auto it = g_udp_map.find(sess->session_key);
+            if (it != g_udp_map.end() && it->second == sess) g_udp_map.erase(it);
             return 0;
         }
         if (v_resp[1] > 0) {
@@ -869,7 +896,8 @@ static unsigned __stdcall udp_session_worker(void* arg) {
                 delete v_stream;
                 sess->v_stream = nullptr;
                 std::lock_guard<std::mutex> lk2(g_udp_table_mtx);
-                g_udp_map.erase(sess->session_key);
+                auto it = g_udp_map.find(sess->session_key);
+                if (it != g_udp_map.end() && it->second == sess) g_udp_map.erase(it);
                 return 0;
             }
         }
@@ -883,7 +911,10 @@ static unsigned __stdcall udp_session_worker(void* arg) {
 
         if (g_cfg.outbound_proto == PROTO_TROJAN) {
             uint8_t atyp = 0;
-            if (!v_stream->recv_exact(&atyp, 1)) break;
+            if (!v_stream->recv_exact(&atyp, 1)) {
+                if (WSAGetLastError() == WSAETIMEDOUT && (GetTickCount64() - sess->last_tick < 30000)) continue;
+                break;
+            }
             if (atyp == 0x01) { // IPv4
                 uint32_t rip; uint16_t rport;
                 if (!v_stream->recv_exact(&rip, 4)) break;
@@ -914,7 +945,10 @@ static unsigned __stdcall udp_session_worker(void* arg) {
             if (!v_stream->recv_exact(crlf, 2)) break;
         } else {
             uint8_t len_bytes[2];
-            if (!v_stream->recv_exact(len_bytes, 2)) break;
+            if (!v_stream->recv_exact(len_bytes, 2)) {
+                if (WSAGetLastError() == WSAETIMEDOUT && (GetTickCount64() - sess->last_tick < 30000)) continue;
+                break;
+            }
             dlen = (static_cast<uint16_t>(len_bytes[0]) << 8) | len_bytes[1];
         }
 
@@ -959,7 +993,8 @@ static unsigned __stdcall udp_session_worker(void* arg) {
     }
     {
         std::lock_guard<std::mutex> lk(g_udp_table_mtx);
-        g_udp_map.erase(sess->session_key);
+        auto it = g_udp_map.find(sess->session_key);
+        if (it != g_udp_map.end() && it->second == sess) g_udp_map.erase(it);
     }
     return 0;
 }
@@ -1058,8 +1093,7 @@ static unsigned __stdcall tcp_listener_thread(void* arg) {
             log_msg("tcp_listener: port %u has no NAT entry! Dropping.", c_port);
             closesocket(c_sock); continue;
         }
-        in_addr orig_ip; orig_ip.s_addr = entry.orig_dst_ip;
-        log_msg("tcp_listener: ACCEPT port %u -> target %s:%u", c_port, inet_ntoa(orig_ip), ntohs(entry.orig_dst_port));
+        log_msg("tcp_listener: ACCEPT port %u -> target %s:%u", c_port, mask_ip(entry.orig_dst_ip).c_str(), ntohs(entry.orig_dst_port));
         uintptr_t h = _beginthreadex(nullptr, 65536, tcp_session_thread, new SessionArgs{ c_sock, entry.orig_dst_ip, entry.orig_dst_port }, 0, nullptr);
         if (h) CloseHandle(reinterpret_cast<HANDLE>(h));
     }
@@ -1217,6 +1251,9 @@ void trigger_async_ping() {
     if (h) CloseHandle(reinterpret_cast<HANDLE>(h));
 }
 
+static HANDLE g_hMasterThread = nullptr;
+static std::mutex g_master_thread_mtx;
+
 void stop_tunnel() {
     g_TunnelRun = false;
     log_msg("Stopping tunnel...");
@@ -1235,11 +1272,11 @@ void stop_tunnel() {
     native_delete_route(g_TunLuid, g_TunIfIndex, "8.8.8.8", 32, "10.66.66.2");
 
     NET_LUID zero_luid{};
-    std::string v_ip = resolve_to_ip_str(g_cfg.vless_ip);
+    std::string v_ip = g_cfg.vless_resolved_ip.empty() ? resolve_to_ip_str(g_cfg.vless_ip) : g_cfg.vless_resolved_ip;
     if (!v_ip.empty()) {
         native_delete_route(zero_luid, g_PhysIfIndex, v_ip.c_str(), 32, g_PhysGateway.c_str());
     }
-    std::string c_ip = resolve_to_ip_str(g_cfg.chain_ip);
+    std::string c_ip = g_cfg.chain_resolved_ip.empty() ? resolve_to_ip_str(g_cfg.chain_ip) : g_cfg.chain_resolved_ip;
     if (!c_ip.empty()) {
         native_delete_route(zero_luid, g_PhysIfIndex, c_ip.c_str(), 32, g_PhysGateway.c_str());
     }
@@ -1255,13 +1292,35 @@ void stop_tunnel() {
         g_udp_map.clear();
     }
 
-    run_silent_cmd("netsh advfirewall firewall delete rule name=\"NanoRayRelay\"");
-    if (!g_TunAlias.empty()) {
-        char del_cmd[512];
-        std::snprintf(del_cmd, sizeof(del_cmd), "netsh interface ipv6 delete route ::/1 \"%ls\"", g_TunAlias.c_str());
-        run_silent_cmd(del_cmd);
-        std::snprintf(del_cmd, sizeof(del_cmd), "netsh interface ipv6 delete route 8000::/1 \"%ls\"", g_TunAlias.c_str());
-        run_silent_cmd(del_cmd);
+    // Clean up firewall rules and IPv6 routes asynchronously to avoid blocking UI flyout thread
+    std::wstring tun_alias = g_TunAlias;
+    uintptr_t hClean = _beginthreadex(nullptr, 65536, [](void* arg) -> unsigned {
+        std::wstring* pAlias = static_cast<std::wstring*>(arg);
+        run_silent_cmd("netsh advfirewall firewall delete rule name=\"NanoRayRelay\"");
+        if (pAlias && !pAlias->empty()) {
+            char del_cmd[512];
+            std::snprintf(del_cmd, sizeof(del_cmd), "netsh interface ipv6 delete route ::/1 \"%ls\"", pAlias->c_str());
+            run_silent_cmd(del_cmd);
+            std::snprintf(del_cmd, sizeof(del_cmd), "netsh interface ipv6 delete route 8000::/1 \"%ls\"", pAlias->c_str());
+            run_silent_cmd(del_cmd);
+        }
+        delete pAlias;
+        return 0;
+    }, new std::wstring(tun_alias), 0, nullptr);
+    if (hClean) CloseHandle(reinterpret_cast<HANDLE>(hClean));
+
+    // Wait for packet loop / master thread to exit so g_Session is not accessed concurrently
+    {
+        HANDLE hMaster = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_master_thread_mtx);
+            hMaster = g_hMasterThread;
+            g_hMasterThread = nullptr;
+        }
+        if (hMaster) {
+            WaitForSingleObject(hMaster, 1500);
+            CloseHandle(hMaster);
+        }
     }
 
     {
@@ -1273,7 +1332,7 @@ void stop_tunnel() {
     g_LastPingMs = PING_IDLE;
     EmptyWorkingSet(GetCurrentProcess());
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
-    g_StatusMsg = "Tunnel stopped & system routes restored";
+    set_status_msg("Tunnel stopped & system routes restored");
     log_msg("Tunnel stopped cleanly.");
     update_tray_icon();
     request_flyout_repaint();
@@ -1289,10 +1348,11 @@ static unsigned __stdcall tunnel_master_thread(void*) {
     parse_vless_uri(g_cfg.raw_vless_uri);
     sync_chain_fields();
     g_cfg.vless_resolved_ip = resolve_to_ip_str(g_cfg.vless_ip);
+    g_cfg.chain_resolved_ip = resolve_to_ip_str(g_cfg.chain_ip);
 
     bool has_proxy = (g_cfg.chain_type != CHAIN_NONE && !g_cfg.chain_ip.empty() && g_cfg.chain_port != 0);
     if (!g_cfg.vless_valid && !has_proxy) {
-        g_StatusMsg = "Error: Configure a VLESS server or an Upstream Proxy";
+        set_status_msg("Error: Configure a VLESS server or an Upstream Proxy");
         g_State = STATE_DISCONNECTED; update_tray_icon(); request_flyout_repaint(); return 0;
     }
     if (g_cfg.chain_type != CHAIN_NONE && (g_cfg.chain_ip.empty() || g_cfg.chain_port == 0)) {
@@ -1302,31 +1362,31 @@ static unsigned __stdcall tunnel_master_thread(void*) {
                 g_cfg.chain_type = CHAIN_NONE;
                 save_config_ini();
             } else {
-                g_StatusMsg = "Error: Upstream proxy address is empty";
+                set_status_msg("Error: Upstream proxy address is empty");
                 g_State = STATE_DISCONNECTED; update_tray_icon(); request_flyout_repaint(); return 0;
             }
         } else {
-            g_StatusMsg = "Invalid upstream proxy host:port";
+            set_status_msg("Invalid upstream proxy host:port");
             log_msg("Cannot start tunnel: Invalid upstream proxy address '%s'", g_cfg.chain_addr_str.c_str());
             g_State = STATE_FAILED; update_tray_icon(); request_flyout_repaint(); return 0;
         }
     }
     save_config_ini();
     g_State = STATE_CONNECTING;
-    g_StatusMsg = "Detecting physical interface & loading Wintun...";
+    set_status_msg("Detecting physical interface & loading Wintun...");
     update_tray_icon(); request_flyout_repaint();
 
     g_PhysGateway.clear();
     if (!find_physical_adapter(g_PhysIfIndex, g_PhysGateway)) {
         if (GetBestInterface(inet_addr("8.8.8.8"), &g_PhysIfIndex) != NO_ERROR) {
-            g_StatusMsg = "Error: No active physical internet connection!";
+            set_status_msg("Error: No active physical internet connection!");
             g_State = STATE_FAILED; update_tray_icon(); request_flyout_repaint(); return 0;
         }
     }
     log_msg("Physical interface: Index=%lu, Gateway=%s", g_PhysIfIndex, g_PhysGateway.c_str());
 
     if (!load_wintun_dll()) {
-        g_StatusMsg = "Error: wintun.dll missing next to executable!";
+        set_status_msg("Error: wintun.dll missing next to executable!");
         g_State = STATE_FAILED; update_tray_icon(); request_flyout_repaint(); return 0;
     }
 
@@ -1337,7 +1397,7 @@ static unsigned __stdcall tunnel_master_thread(void*) {
         g_Adapter = WintunOpenAdapter(L"NanoRayTun");
     }
     if (!g_Adapter) {
-        g_StatusMsg = "Error: Run application as Administrator!";
+        set_status_msg("Error: Run application as Administrator!");
         log_msg("WintunCreateAdapter failed! Error=%lu", GetLastError());
         g_State = STATE_FAILED; update_tray_icon(); request_flyout_repaint(); return 0;
     }
@@ -1364,12 +1424,12 @@ static unsigned __stdcall tunnel_master_thread(void*) {
     g_Session = WintunStartSession(g_Adapter, 0x200000);
     if (!g_Session) {
         WintunCloseAdapter(g_Adapter); g_Adapter = nullptr;
-        g_StatusMsg = "Error: Failed to start Wintun ring buffer!";
+        set_status_msg("Error: Failed to start Wintun ring buffer!");
         log_msg("WintunStartSession failed! Error=%lu", GetLastError());
         g_State = STATE_FAILED; update_tray_icon(); request_flyout_repaint(); return 0;
     }
 
-    g_StatusMsg = "Configuring virtual adapter & system routes...";
+    set_status_msg("Configuring virtual adapter & system routes...");
     request_flyout_repaint();
 
     // 1. Configure IP on TUN adapter via native IP Helper API (< 1ms)
@@ -1382,6 +1442,13 @@ static unsigned __stdcall tunnel_master_thread(void*) {
     ip_row.DadState = IpDadStatePreferred;
     DWORD ip_res = CreateUnicastIpAddressEntry(&ip_row);
     log_msg("CreateUnicastIpAddressEntry returned %lu", ip_res);
+    if (ip_res != NO_ERROR && ip_res != ERROR_OBJECT_ALREADY_EXISTS) {
+        log_msg("Failed to assign IP 10.66.66.1 to TUN interface: error %lu", ip_res);
+        set_status_msg("Error: Failed to configure TUN IP address");
+        g_State = STATE_FAILED; update_tray_icon(); request_flyout_repaint();
+        stop_tunnel();
+        return 0;
+    }
 
     // 2. Set interface metric to 1 natively via IP Helper API (< 1ms)
     MIB_IPINTERFACE_ROW if_row{};
@@ -1422,7 +1489,7 @@ static unsigned __stdcall tunnel_master_thread(void*) {
     laddr.sin_addr.s_addr = inet_addr(g_cfg.tun_ip_str);
     laddr.sin_port = htons(g_cfg.relay_port);
     if (bind(g_ListenSock, reinterpret_cast<sockaddr*>(&laddr), sizeof(laddr)) != 0 || listen(g_ListenSock, SOMAXCONN) != 0) {
-        g_StatusMsg = "Error: Failed to bind local NAT listener";
+        set_status_msg("Error: Failed to bind local NAT listener");
         log_msg("Failed to bind local NAT listener: WSAError=%d", WSAGetLastError());
         stop_tunnel(); return 0;
     }
@@ -1432,12 +1499,12 @@ static unsigned __stdcall tunnel_master_thread(void*) {
     if (hListener) CloseHandle(reinterpret_cast<HANDLE>(hListener));
 
     // 5. Direct host route bypass for VLESS endpoint & upstream proxy via native IP Helper API (< 1ms)
-    std::string v_ip = resolve_to_ip_str(g_cfg.vless_ip);
+    std::string v_ip = g_cfg.vless_resolved_ip.empty() ? resolve_to_ip_str(g_cfg.vless_ip) : g_cfg.vless_resolved_ip;
     if (!g_PhysGateway.empty() && !v_ip.empty()) {
         NET_LUID zero_luid{};
         native_add_route(zero_luid, g_PhysIfIndex, v_ip.c_str(), 32, g_PhysGateway.c_str(), 1);
     }
-    std::string c_ip = resolve_to_ip_str(g_cfg.chain_ip);
+    std::string c_ip = g_cfg.chain_resolved_ip.empty() ? resolve_to_ip_str(g_cfg.chain_ip) : g_cfg.chain_resolved_ip;
     if (!g_PhysGateway.empty() && g_cfg.chain_type != CHAIN_NONE && !c_ip.empty()) {
         NET_LUID zero_luid{};
         native_add_route(zero_luid, g_PhysIfIndex, c_ip.c_str(), 32, g_PhysGateway.c_str(), 1);
@@ -1454,16 +1521,16 @@ static unsigned __stdcall tunnel_master_thread(void*) {
     g_ConnectTick = GetTickCount64();
     g_State = STATE_CONNECTED;
     if (is_other_vpn_active()) {
-        g_StatusMsg = "Connected - NOTE: Disconnect other VPNs (Throne) to route traffic";
+        set_status_msg("Connected - NOTE: Disconnect other VPNs (Throne) to route traffic");
     } else {
         if (g_cfg.vless_valid) {
-            g_StatusMsg = "Connected - Routing all traffic via " + g_cfg.vless_remark;
+            set_status_msg("Connected - Routing all traffic via " + g_cfg.vless_remark);
         } else {
             std::string p_type = (g_cfg.chain_type == CHAIN_SOCKS5) ? "SOCKS5" : "HTTP";
-            g_StatusMsg = "Connected - Routing traffic via Upstream " + p_type + " (" + g_cfg.chain_ip + ":" + std::to_string(g_cfg.chain_port) + ")";
+            set_status_msg("Connected - Routing traffic via Upstream " + p_type + " (" + g_cfg.chain_ip + ":" + std::to_string(g_cfg.chain_port) + ")");
         }
     }
-    log_msg("Tunnel active! Status: %s", g_StatusMsg.c_str());
+    log_msg("Tunnel active! Status: %s", get_status_msg().c_str());
     update_tray_icon(); request_flyout_repaint();
 
     uint32_t tun_ip_net = inet_addr(g_cfg.tun_ip_str), tun_peer_net = inet_addr(g_cfg.tun_peer_str);
@@ -1488,8 +1555,7 @@ static unsigned __stdcall tunnel_master_thread(void*) {
             static uint32_t pkt_cnt = 0;
             uint32_t c = ++pkt_cnt;
             if (c <= 25 || (c % 200 == 0)) {
-                in_addr sa, da; sa.s_addr = ip->saddr; da.s_addr = ip->daddr;
-                log_msg("Wintun pkt #%u: proto=%u %s -> %s (len=%lu)", c, ip->protocol, inet_ntoa(sa), inet_ntoa(da), pkt_size);
+                log_msg("Wintun pkt #%u: proto=%u -> %s (len=%lu)", c, ip->protocol, mask_ip(ip->daddr).c_str(), pkt_size);
             }
             if (ip->protocol == IPPROTO_TCP && pkt_size >= static_cast<DWORD>(ihl + sizeof(TCPHeader))) {
                 TCPHeader* tcp = reinterpret_cast<TCPHeader*>(pkt + ihl);
@@ -1524,7 +1590,12 @@ static unsigned __stdcall tunnel_master_thread(void*) {
                             DnsJob* job = new DnsJob{ ip->saddr, ip->daddr, udp->source, udp->dest, static_cast<uint16_t>(ulen), {} };
                             std::memcpy(job->payload, pkt + ihl + sizeof(UDPHeader), ulen);
                             uintptr_t hDns = _beginthreadex(nullptr, 65536, dns_hijack_worker, job, 0, nullptr);
-                            if (hDns) CloseHandle(reinterpret_cast<HANDLE>(hDns));
+                            if (hDns) {
+                                CloseHandle(reinterpret_cast<HANDLE>(hDns));
+                            } else {
+                                delete job;
+                                g_active_dns_workers.fetch_sub(1);
+                            }
                         }
                     }
                 } else if (ip->saddr == tun_ip_net) {
@@ -1549,6 +1620,10 @@ void start_tunnel_async() {
     if (g_State.load() == STATE_CONNECTED || g_State.load() == STATE_CONNECTING) return;
     bool expected = false;
     if (!g_StartingTunnel.compare_exchange_strong(expected, true)) return;
-    uintptr_t h = _beginthreadex(nullptr, 65536, tunnel_master_thread, nullptr, 0, nullptr);
-    if (h) CloseHandle(reinterpret_cast<HANDLE>(h));
+    std::lock_guard<std::mutex> lk(g_master_thread_mtx);
+    if (g_hMasterThread) {
+        CloseHandle(g_hMasterThread);
+        g_hMasterThread = nullptr;
+    }
+    g_hMasterThread = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 65536, tunnel_master_thread, nullptr, 0, nullptr));
 }

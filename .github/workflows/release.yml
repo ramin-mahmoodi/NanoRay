@@ -39,7 +39,15 @@ jobs:
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile "wintun.zip"
+          $zipHash = (Get-FileHash "wintun.zip" -Algorithm SHA256).Hash.ToLower()
+          if ($zipHash -ne "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51") {
+            throw "wintun.zip SHA256 mismatch: $zipHash"
+          }
           Expand-Archive -Path "wintun.zip" -DestinationPath "wintun_tmp"
+          $dllHash = (Get-FileHash "wintun_tmp/wintun/bin/amd64/wintun.dll" -Algorithm SHA256).Hash.ToLower()
+          if ($dllHash -ne "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce") {
+            throw "wintun.dll SHA256 mismatch: $dllHash"
+          }
           Copy-Item "wintun_tmp/wintun/bin/amd64/wintun.dll" -Destination "wintun.dll"
           Remove-Item "wintun.zip", "wintun_tmp" -Recurse -Force
 

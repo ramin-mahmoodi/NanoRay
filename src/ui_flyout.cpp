@@ -874,7 +874,8 @@ static void render_flyout_graphics(Graphics& g, float scale, bool is_dark) {
                 g.DrawEllipse(&pulse_pen, dot_cx - ring_r, dot_cy - ring_r, ring_r * 2.0f, ring_r * 2.0f);
             }
         } else if (st == STATE_FAILED && can_connect) {
-            status_line = g_StatusMsg.empty() ? L"Connection failed" : to_wstr(g_StatusMsg);
+            std::string smsg = get_status_msg();
+            status_line = smsg.empty() ? L"Connection failed" : to_wstr(smsg);
             status_col = theme.danger_text;
             dot_col = Color(255, 239, 68, 68); // #ef4444
         } else {
@@ -1338,7 +1339,7 @@ void show_tray_flyout() {
     bool can_connect = g_cfg.vless_valid || (g_cfg.chain_type != CHAIN_NONE && !g_cfg.chain_addr_str.empty());
     if (!can_connect && g_State.load() == STATE_FAILED) {
         g_State = STATE_DISCONNECTED;
-        g_StatusMsg.clear();
+        set_status_msg("");
         update_tray_icon();
     }
 
@@ -1529,6 +1530,8 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         }
         return 0;
     case WM_RBUTTONUP: {
+        TunnelState st_rb = g_State.load();
+        if (st_rb == STATE_CONNECTED || st_rb == STATE_CONNECTING) return 0;
         SetForegroundWindow(hwnd);
         SetActiveWindow(hwnd);
         SetFocus(hwnd);
@@ -1556,7 +1559,7 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     *s = to_utf8(w);
                     if (clicked_f == FIELD_VLESS_URI) {
                         parse_vless_uri(*s);
-                        g_StatusMsg = g_cfg.vless_valid ? (std::string(g_cfg.outbound_proto == PROTO_TROJAN ? "Loaded Trojan: " : "Loaded: ") + g_cfg.vless_ip + ":" + std::to_string(g_cfg.vless_port)) : "Invalid URI";
+                        set_status_msg(g_cfg.vless_valid ? (std::string(g_cfg.outbound_proto == PROTO_TROJAN ? "Loaded Trojan: " : "Loaded: ") + g_cfg.vless_ip + ":" + std::to_string(g_cfg.vless_port)) : "Invalid URI");
                     } else {
                         sync_chain_fields();
                     }
@@ -1576,10 +1579,15 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         int x = static_cast<int>(GET_X_LPARAM(lParam) / scale);
         int y = static_cast<int>(GET_Y_LPARAM(lParam) / scale);
 
+        TunnelState cur_st = g_State.load();
+        bool is_busy = (cur_st == STATE_CONNECTED || cur_st == STATE_CONNECTING);
+
         ActiveInputField clicked_f = FIELD_NONE;
-        if (pt_in_rect(x, y, R_INP_VLESS_URI)) clicked_f = FIELD_VLESS_URI;
-        else if (g_cfg.chain_type != CHAIN_NONE && pt_in_rect(x, y, R_INP_CH_ADDR)) clicked_f = FIELD_CHAIN_ADDR;
-        else if (g_cfg.chain_type != CHAIN_NONE && pt_in_rect(x, y, R_INP_CH_AUTH)) clicked_f = FIELD_CHAIN_AUTH;
+        if (!is_busy) {
+            if (pt_in_rect(x, y, R_INP_VLESS_URI)) clicked_f = FIELD_VLESS_URI;
+            else if (g_cfg.chain_type != CHAIN_NONE && pt_in_rect(x, y, R_INP_CH_ADDR)) clicked_f = FIELD_CHAIN_ADDR;
+            else if (g_cfg.chain_type != CHAIN_NONE && pt_in_rect(x, y, R_INP_CH_AUTH)) clicked_f = FIELD_CHAIN_AUTH;
+        }
 
         if (clicked_f != FIELD_NONE) {
             const RectF* rf = get_field_rect(clicked_f);
@@ -1634,7 +1642,6 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 trigger_async_ping();
             }
         } else if (pt_in_rect(x, y, R_BTN_CONNECT)) {
-            TunnelState cur_st = g_State.load();
             if (cur_st == STATE_CONNECTED || cur_st == STATE_CONNECTING) {
                 g_PressedBtn = 2;
                 stop_tunnel();
@@ -1651,38 +1658,44 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 }
             }
         } else if (pt_in_rect(x, y, R_BTN_CLEAR_URI)) {
+            if (is_busy) return 0;
             g_PressedBtn = 7;
             g_cfg.raw_vless_uri.clear(); g_cfg.vless_valid = false;
             g_CaretPos = g_SelStart = g_SelEnd = g_ScrollOffset = 0;
             if (g_State.load() == STATE_FAILED) g_State = STATE_DISCONNECTED;
-            save_config_ini(); g_StatusMsg = "Server URI cleared";
+            save_config_ini(); set_status_msg("Server URI cleared");
             update_tray_icon();
         } else if (pt_in_rect(x, y, R_BTN_PASTE_URI) || (!g_cfg.vless_valid && pt_in_rect(x, y, R_EMPTY_URI))) {
+            if (is_busy) return 0;
             g_PressedBtn = 3;
             std::string clip = read_clipboard_text(hwnd);
             if (parse_vless_uri(clip)) {
                 g_CaretPos = g_SelStart = g_SelEnd = static_cast<int>(to_wstr(g_cfg.raw_vless_uri).size());
                 g_ScrollOffset = 0; save_config_ini();
-                g_StatusMsg = std::string(g_cfg.outbound_proto == PROTO_TROJAN ? "Loaded Trojan: " : "Loaded node: ") + g_cfg.vless_ip + ":" + std::to_string(g_cfg.vless_port);
+                set_status_msg(std::string(g_cfg.outbound_proto == PROTO_TROJAN ? "Loaded Trojan: " : "Loaded node: ") + g_cfg.vless_ip + ":" + std::to_string(g_cfg.vless_port));
             } else {
-                g_StatusMsg = "Clipboard does not contain a valid vless:// or trojan:// URI";
+                set_status_msg("Clipboard does not contain a valid vless:// or trojan:// URI");
             }
         } else if (pt_in_rect(x, y, R_BTN_CH_NONE)) {
+            if (is_busy) return 0;
             g_PressedBtn = 10;
             g_cfg.chain_type = CHAIN_NONE;
             g_SegTargetX = 27.0f;
             save_config_ini();
         } else if (pt_in_rect(x, y, R_BTN_CH_SOCKS5)) {
+            if (is_busy) return 0;
             g_PressedBtn = 11;
             g_cfg.chain_type = CHAIN_SOCKS5;
             g_SegTargetX = 143.0f;
             save_config_ini();
         } else if (pt_in_rect(x, y, R_BTN_CH_HTTP)) {
+            if (is_busy) return 0;
             g_PressedBtn = 12;
             g_cfg.chain_type = CHAIN_HTTP;
             g_SegTargetX = 259.0f;
             save_config_ini();
         } else if (pt_in_rect(x, y, R_BTN_PASTE_CH)) {
+            if (is_busy) return 0;
             g_PressedBtn = 8;
             std::string clip = read_clipboard_text(hwnd);
             if (!clip.empty()) {
@@ -1691,7 +1704,7 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 size_t at = clip.find('@');
                 if (at != std::string::npos) { g_cfg.chain_auth_str = clip.substr(0, at); g_cfg.chain_addr_str = clip.substr(at + 1); }
                 else g_cfg.chain_addr_str = clip;
-                sync_chain_fields(); save_config_ini(); g_StatusMsg = "Updated upstream proxy from clipboard";
+                sync_chain_fields(); save_config_ini(); set_status_msg("Updated upstream proxy from clipboard");
             }
         } else if (pt_in_rect(x, y, R_BTN_FLUSHDNS)) {
             g_PressedBtn = 4;
@@ -1704,7 +1717,7 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 if (DnsFlushResolverCache) DnsFlushResolverCache();
                 FreeLibrary(hDns);
             }
-            g_StatusMsg = "Windows DNS cache flushed successfully";
+            set_status_msg("Windows DNS cache flushed successfully");
         } else if (pt_in_rect(x, y, R_BTN_EXIT)) {
             g_PressedBtn = 6;
             stop_tunnel();
@@ -1717,6 +1730,8 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         return 0;
     }
     case WM_KEYDOWN: {
+        TunnelState st = g_State.load();
+        if (st == STATE_CONNECTED || st == STATE_CONNECTING) return 0;
         if (g_FocusField == FIELD_NONE) return 0;
         std::string* target = get_field_string(g_FocusField);
         if (!target) return 0;
@@ -1872,6 +1887,8 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         return 0;
     }
     case WM_CHAR: {
+        TunnelState st = g_State.load();
+        if (st == STATE_CONNECTED || st == STATE_CONNECTING) return 0;
         if (g_FocusField == FIELD_NONE) return 0;
         std::string* target = get_field_string(g_FocusField);
         if (!target) return 0;

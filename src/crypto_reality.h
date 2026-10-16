@@ -294,8 +294,9 @@ static inline void x25519_base(uint8_t out[32], const uint8_t secret[32]) {
 // ---------------------------------------------------------------------------
 // 4. Cryptographic PRNG & AES-GCM (128 & 256) & HMAC-SHA512 (via CNG)
 // ---------------------------------------------------------------------------
-static inline void secure_random(void* buf, size_t len) {
-    BCryptGenRandom(nullptr, static_cast<PUCHAR>(buf), static_cast<ULONG>(len), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+static inline bool secure_random(void* buf, size_t len) {
+    NTSTATUS status = BCryptGenRandom(nullptr, static_cast<PUCHAR>(buf), static_cast<ULONG>(len), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    return BCRYPT_SUCCESS(status);
 }
 
 static inline bool aes_gcm_encrypt(

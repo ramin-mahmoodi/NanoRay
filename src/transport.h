@@ -38,7 +38,8 @@ public:
         return true;
     }
 
-    virtual ITransportStream* get_underlying() const { return nullptr; }
+    virtual ITransportStream* unwrap_vision() { return this; }
+    virtual void shutdown_send() {}
     virtual void set_rcv_timeout(int /*timeout_ms*/) {}
 };
 
@@ -78,6 +79,12 @@ public:
         if (m_sock != INVALID_SOCKET) {
             DWORD tv = static_cast<DWORD>(timeout_ms);
             setsockopt(m_sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+        }
+    }
+
+    void shutdown_send() override {
+        if (m_sock != INVALID_SOCKET) {
+            ::shutdown(m_sock, SD_SEND);
         }
     }
 
@@ -200,6 +207,7 @@ public:
     }
 
     bool send_all(const void* buf, int len) override {
+        std::lock_guard<std::mutex> lk(m_op_mtx);
         if (!m_ctx_valid || m_sizes.cbMaximumMessage == 0) return false;
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(buf);
         int remaining = len;
@@ -262,6 +270,60 @@ public:
                 continue;
             }
 
+            if (status == SEC_I_RENEGOTIATE) {
+                for (int i = 0; i < 4; ++i) {
+                    if (buffers[i].BufferType == SECBUFFER_DATA && buffers[i].cbBuffer > 0) {
+                        uint8_t* p = reinterpret_cast<uint8_t*>(buffers[i].pvBuffer);
+                        m_dec_queue.insert(m_dec_queue.end(), p, p + buffers[i].cbBuffer);
+                    }
+                }
+                SecBuffer* extra = nullptr;
+                for (int i = 0; i < 4; ++i) {
+                    if (buffers[i].BufferType == SECBUFFER_EXTRA) { extra = &buffers[i]; break; }
+                }
+                if (extra && extra->cbBuffer > 0) {
+                    int extra_len = extra->cbBuffer;
+                    std::vector<uint8_t> remaining(m_enc_buf.end() - extra_len, m_enc_buf.end());
+                    m_enc_buf = std::move(remaining);
+
+                    SecBuffer inBuffers[2];
+                    inBuffers[0] = { (DWORD)m_enc_buf.size(), SECBUFFER_TOKEN, m_enc_buf.data() };
+                    inBuffers[1] = { 0, SECBUFFER_EMPTY, nullptr };
+                    SecBufferDesc inDesc{ SECBUFFER_VERSION, 2, inBuffers };
+
+                    SecBuffer outBuf{ 0, SECBUFFER_TOKEN, nullptr };
+                    SecBufferDesc outDesc{ SECBUFFER_VERSION, 1, &outBuf };
+
+                    DWORD reqFlags = ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT |
+                                     ISC_REQ_CONFIDENTIALITY | ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_STREAM;
+                    DWORD retFlags = 0;
+                    TimeStamp tsExpiry{};
+                    {
+                        std::lock_guard<std::mutex> lk(m_op_mtx);
+                        if (m_ctx_valid) {
+                            InitializeSecurityContextW(
+                                &m_hCred, &m_hCtx, nullptr, reqFlags, 0, 0,
+                                &inDesc, 0, nullptr, &outDesc, &retFlags, &tsExpiry);
+                        }
+                    }
+                    if (outBuf.cbBuffer > 0 && outBuf.pvBuffer) {
+                        m_underlying->send_all(outBuf.pvBuffer, outBuf.cbBuffer);
+                        FreeContextBuffer(outBuf.pvBuffer);
+                    }
+                    if (inBuffers[1].BufferType == SECBUFFER_EXTRA && inBuffers[1].cbBuffer > 0) {
+                        int rem_extra = inBuffers[1].cbBuffer;
+                        std::vector<uint8_t> rem(m_enc_buf.end() - rem_extra, m_enc_buf.end());
+                        m_enc_buf = std::move(rem);
+                    } else {
+                        m_enc_buf.clear();
+                    }
+                } else {
+                    m_enc_buf.clear();
+                }
+                if (!m_dec_queue.empty()) break;
+                continue;
+            }
+
             if (status == SEC_E_OK || status == SEC_I_CONTEXT_EXPIRED) {
                 for (int i = 0; i < 4; ++i) {
                     if (buffers[i].BufferType == SECBUFFER_DATA && buffers[i].cbBuffer > 0) {
@@ -310,7 +372,9 @@ public:
         }
     }
 
-    ITransportStream* get_underlying() const override { return m_underlying; }
+    void shutdown_send() override {
+        if (m_underlying) m_underlying->shutdown_send();
+    }
     void set_rcv_timeout(int timeout_ms) override {
         if (m_underlying) m_underlying->set_rcv_timeout(timeout_ms);
     }
@@ -337,7 +401,7 @@ public:
         // Generate random 16-byte WebSocket Key
         static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         uint8_t nonce[16];
-        reality::secure_random(nonce, 16);
+        if (!reality::secure_random(nonce, 16)) return false;
         std::string ws_key;
         int val = 0, valb = -6;
         for (uint8_t c : nonce) {
@@ -476,7 +540,9 @@ public:
         if (m_underlying) m_underlying->close();
     }
 
-    ITransportStream* get_underlying() const override { return m_underlying; }
+    void shutdown_send() override {
+        if (m_underlying) m_underlying->shutdown_send();
+    }
     void set_rcv_timeout(int timeout_ms) override {
         if (m_underlying) m_underlying->set_rcv_timeout(timeout_ms);
     }
@@ -503,7 +569,7 @@ public:
 
         static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         uint8_t nonce[16];
-        reality::secure_random(nonce, 16);
+        if (!reality::secure_random(nonce, 16)) return false;
         std::string ws_key;
         int val = 0, valb = -6;
         for (uint8_t c : nonce) {
@@ -550,7 +616,9 @@ public:
         if (m_underlying) m_underlying->close();
     }
 
-    ITransportStream* get_underlying() const override { return m_underlying; }
+    void shutdown_send() override {
+        if (m_underlying) m_underlying->shutdown_send();
+    }
     void set_rcv_timeout(int timeout_ms) override {
         if (m_underlying) m_underlying->set_rcv_timeout(timeout_ms);
     }
@@ -602,10 +670,10 @@ public:
 
         // 1. Generate client random & ephemeral keys with cryptographically secure PRNG
         uint8_t client_random[32];
-        reality::secure_random(client_random, 32);
+        if (!reality::secure_random(client_random, 32)) return false;
 
         uint8_t client_priv[32], client_pub[32];
-        reality::secure_random(client_priv, 32);
+        if (!reality::secure_random(client_priv, 32)) return false;
         client_priv[0] &= 248; client_priv[31] &= 127; client_priv[31] |= 64;
         reality::x25519_base(client_pub, client_priv);
 
@@ -685,7 +753,11 @@ public:
         if (sh.size() < p + sh_sid_len + 3) return false;
         p += sh_sid_len;
         uint16_t cipher_suite = (sh[p] << 8) | sh[p + 1];
-        size_t traffic_key_len = (cipher_suite == 0x1302) ? 32 : 16;
+        if (cipher_suite != 0x1301) {
+            // Only TLS_AES_128_GCM_SHA256 (0x1301) is supported by REALITY HKDF-SHA256
+            return false;
+        }
+        size_t traffic_key_len = 16;
         m_traffic_key_len = traffic_key_len;
         p += 2; // cipher suite
         p += 1; // compression method
@@ -746,6 +818,7 @@ public:
         // 8. Decrypt Server's Encrypted Handshake Records & Authenticate Server
         uint64_t s_hs_seq = 0;
         bool server_finished = false;
+        bool saw_cert = false;
 
         while (!server_finished) {
             uint8_t enc_hdr[5];
@@ -795,50 +868,52 @@ public:
                 // Server Authentication: Validate leaf certificate HMAC
                 if (msg_type == 0x0b) { // Certificate message
                     size_t c_pos = idx + 4;
-                    if (c_pos < idx + total_msg) {
-                        uint8_t req_ctx_len = dec[c_pos++];
-                        c_pos += req_ctx_len;
-                        if (c_pos + 6 <= idx + total_msg) {
-                            c_pos += 3; // skip cert_list_len
-                            uint32_t cert_len = (dec[c_pos] << 16) | (dec[c_pos + 1] << 8) | dec[c_pos + 2];
-                            c_pos += 3;
-                            if (c_pos + cert_len <= idx + total_msg) {
-                                const uint8_t* cert_der = dec.data() + c_pos;
-                                bool cert_ok = false;
-                                for (size_t s = 0; s + 38 < cert_len; ++s) {
-                                    if (cert_der[s] == 0x2b && cert_der[s + 1] == 0x65 && cert_der[s + 2] == 0x70) {
-                                        for (size_t k = s + 3; k + 35 < cert_len && k < s + 20; ++k) {
-                                            if (cert_der[k] == 0x03 && cert_der[k + 1] == 0x21 && cert_der[k + 2] == 0x00) {
-                                                const uint8_t* pub = cert_der + k + 3;
-                                                if (cert_len >= 67) {
-                                                    size_t sig_pos = cert_len - 67;
-                                                    while (sig_pos > 0 && !(cert_der[sig_pos] == 0x03 && cert_der[sig_pos + 1] == 0x41 && cert_der[sig_pos + 2] == 0x00)) {
-                                                        sig_pos--;
-                                                    }
-                                                    if (cert_der[sig_pos] == 0x03 && cert_der[sig_pos + 1] == 0x41 && cert_der[sig_pos + 2] == 0x00) {
-                                                        const uint8_t* sig = cert_der + sig_pos + 3;
-                                                        uint8_t hmac_out[64];
-                                                        if (reality::hmac_sha512(auth_key, 32, pub, 32, hmac_out)) {
-                                                            if (std::memcmp(hmac_out, sig, 64) == 0) {
-                                                                cert_ok = true;
-                                                            }
-                                                        }
-                                                    }
+                    if (c_pos >= idx + total_msg) return false;
+                    uint8_t req_ctx_len = dec[c_pos++];
+                    c_pos += req_ctx_len;
+                    if (c_pos + 6 > idx + total_msg) return false;
+                    c_pos += 3; // skip cert_list_len
+                    uint32_t cert_len = (dec[c_pos] << 16) | (dec[c_pos + 1] << 8) | dec[c_pos + 2];
+                    c_pos += 3;
+                    if (c_pos + cert_len > idx + total_msg) return false;
+                    const uint8_t* cert_der = dec.data() + c_pos;
+                    bool cert_ok = false;
+                    for (size_t s = 0; s + 38 < cert_len; ++s) {
+                        if (cert_der[s] == 0x2b && cert_der[s + 1] == 0x65 && cert_der[s + 2] == 0x70) {
+                            for (size_t k = s + 3; k + 35 < cert_len && k < s + 20; ++k) {
+                                if (cert_der[k] == 0x03 && cert_der[k + 1] == 0x21 && cert_der[k + 2] == 0x00) {
+                                    const uint8_t* pub = cert_der + k + 3;
+                                    if (cert_len >= 67) {
+                                        size_t sig_pos = cert_len - 67;
+                                        while (sig_pos > 0 && !(cert_der[sig_pos] == 0x03 && cert_der[sig_pos + 1] == 0x41 && cert_der[sig_pos + 2] == 0x00)) {
+                                            sig_pos--;
+                                        }
+                                        if (cert_der[sig_pos] == 0x03 && cert_der[sig_pos + 1] == 0x41 && cert_der[sig_pos + 2] == 0x00) {
+                                            const uint8_t* sig = cert_der + sig_pos + 3;
+                                            uint8_t hmac_out[64];
+                                            if (reality::hmac_sha512(auth_key, 32, pub, 32, hmac_out)) {
+                                                if (std::memcmp(hmac_out, sig, 64) == 0) {
+                                                    cert_ok = true;
                                                 }
-                                                break;
                                             }
                                         }
-                                        break;
                                     }
+                                    break;
                                 }
-                                if (!cert_ok) return false;
                             }
+                            break;
                         }
                     }
+                    if (!cert_ok) return false;
+                    saw_cert = true;
                 }
 
                 // Server Authentication: Validate server Finished message
                 if (msg_type == 0x14) { // Finished message
+                    if (!saw_cert) {
+                        // Reject Finished if valid Certificate was not presented first (fail-closed against MITM)
+                        return false;
+                    }
                     uint8_t tr_hash_fin[32];
                     reality::sha256(transcript.data(), transcript.size(), tr_hash_fin);
                     uint8_t s_fin_key[32];
@@ -1023,7 +1098,9 @@ public:
         if (m_underlying) m_underlying->close();
     }
 
-    ITransportStream* get_underlying() const override { return m_underlying; }
+    void shutdown_send() override {
+        if (m_underlying) m_underlying->shutdown_send();
+    }
     void set_rcv_timeout(int timeout_ms) override {
         if (m_underlying) m_underlying->set_rcv_timeout(timeout_ms);
     }
@@ -1107,11 +1184,8 @@ public:
             "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"
             "Content-Type: application/octet-stream\r\n"
             "Transfer-Encoding: chunked\r\n"
-            "X-Padding: " + padding + "\r\n";
-        if (!m_mode.empty() && m_mode != "auto") {
-            req += "X-Action: " + m_mode + "\r\n";
-        }
-        req += "Connection: keep-alive\r\n\r\n";
+            "X-Padding: " + padding + "\r\n"
+            "Connection: keep-alive\r\n\r\n";
 
         return m_underlying->send_all(req.data(), static_cast<int>(req.size()));
     }
@@ -1303,7 +1377,16 @@ public:
         }
     }
 
-    ITransportStream* get_underlying() const override { return m_underlying; }
+    void shutdown_send() override {
+        if (!m_eof_sent) {
+            m_eof_sent = true;
+            if (m_underlying) {
+                const char term[] = "0\r\n\r\n";
+                m_underlying->send_all(term, sizeof(term) - 1);
+                m_underlying->shutdown_send();
+            }
+        }
+    }
     void set_rcv_timeout(int timeout_ms) override {
         if (m_underlying) m_underlying->set_rcv_timeout(timeout_ms);
     }
@@ -1467,7 +1550,10 @@ public:
         }
     }
 
-    ITransportStream* get_underlying() const override { return m_underlying; }
+    ITransportStream* unwrap_vision() override { return m_underlying; }
+    void shutdown_send() override {
+        if (m_underlying) m_underlying->shutdown_send();
+    }
     void set_rcv_timeout(int timeout_ms) override {
         if (m_underlying) m_underlying->set_rcv_timeout(timeout_ms);
     }

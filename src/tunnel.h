@@ -21,7 +21,8 @@ extern std::atomic<uint64_t>    g_TotalRx;
 extern std::atomic<uint64_t>    g_TotalTx;
 extern std::atomic<int>         g_LastPingMs;
 extern ULONGLONG                g_ConnectTick;
-extern std::string              g_StatusMsg;
+void set_status_msg(const std::string& msg);
+std::string get_status_msg();
 
 void run_silent_cmd(const std::string& cmd);
 void start_tunnel_async();

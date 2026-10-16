@@ -41,6 +41,7 @@ struct AppConfig {
     std::string chain_addr_str = "";
     std::string chain_auth_str = "";
     std::string chain_ip       = "";
+    std::string chain_resolved_ip = "";
     uint16_t    chain_port     = 0;
     std::string chain_user     = "";
     std::string chain_pass     = "";

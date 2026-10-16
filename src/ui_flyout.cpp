@@ -1551,6 +1551,7 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 
         if (clicked_f != FIELD_NONE) {
             g_FocusField = clicked_f;
+            std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
             std::string* s = get_field_string(clicked_f);
             if (s) {
                 std::wstring clip = read_clipboard_wtext(hwnd);
@@ -1631,6 +1632,7 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         if (g_FocusField != FIELD_NONE) {
             g_FocusField = FIELD_NONE;
             g_SelStart = g_SelEnd = 0;
+            std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
             parse_vless_uri(g_cfg.raw_vless_uri);
             sync_chain_fields();
             save_config_ini();
@@ -1638,10 +1640,17 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 
         if (pt_in_rect(x, y, R_BTN_THEME)) {
             g_PressedBtn = 9;
-            g_cfg.is_dark_mode = !g_cfg.is_dark_mode;
+            {
+                std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
+                g_cfg.is_dark_mode = !g_cfg.is_dark_mode;
+            }
             save_config_ini();
         } else if (pt_in_rect(x, y, R_BTN_PING)) {
-            bool can_connect = g_cfg.vless_valid || (g_cfg.chain_type != CHAIN_NONE && !g_cfg.chain_addr_str.empty());
+            bool can_connect = false;
+            {
+                std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
+                can_connect = g_cfg.vless_valid || (g_cfg.chain_type != CHAIN_NONE && !g_cfg.chain_addr_str.empty());
+            }
             if (can_connect) {
                 g_PressedBtn = 1;
                 g_LastPingMs = PING_TESTING;
@@ -1652,21 +1661,28 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 g_PressedBtn = 2;
                 stop_tunnel();
             } else {
-                bool can_connect = g_cfg.vless_valid || (g_cfg.chain_type != CHAIN_NONE && !g_cfg.chain_addr_str.empty());
-                if (can_connect) {
-                    g_PressedBtn = 2;
-                    if (g_cfg.chain_type != CHAIN_NONE && g_cfg.chain_addr_str.empty()) {
+                bool can_connect = false;
+                {
+                    std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
+                    can_connect = g_cfg.vless_valid || (g_cfg.chain_type != CHAIN_NONE && !g_cfg.chain_addr_str.empty());
+                    if (can_connect && g_cfg.chain_type != CHAIN_NONE && g_cfg.chain_addr_str.empty()) {
                         g_cfg.chain_type = CHAIN_NONE;
                         g_SegTargetX = 27.0f;
-                        save_config_ini();
                     }
+                }
+                if (can_connect) {
+                    g_PressedBtn = 2;
+                    save_config_ini();
                     start_tunnel_async();
                 }
             }
         } else if (pt_in_rect(x, y, R_BTN_CLEAR_URI)) {
             if (is_busy) return 0;
             g_PressedBtn = 7;
-            g_cfg.raw_vless_uri.clear(); g_cfg.vless_valid = false;
+            {
+                std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
+                g_cfg.raw_vless_uri.clear(); g_cfg.vless_valid = false;
+            }
             g_CaretPos = g_SelStart = g_SelEnd = g_ScrollOffset = 0;
             if (g_State.load() == STATE_FAILED) g_State = STATE_DISCONNECTED;
             save_config_ini(); set_status_msg("Server URI cleared");
@@ -1676,6 +1692,7 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             g_PressedBtn = 3;
             std::string clip = read_clipboard_text(hwnd);
             if (parse_vless_uri(clip)) {
+                std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
                 g_CaretPos = g_SelStart = g_SelEnd = static_cast<int>(to_wstr(g_cfg.raw_vless_uri).size());
                 g_ScrollOffset = 0; save_config_ini();
                 set_status_msg(std::string(g_cfg.outbound_proto == PROTO_TROJAN ? "Loaded Trojan: " : "Loaded node: ") + g_cfg.vless_ip + ":" + std::to_string(g_cfg.vless_port));
@@ -1685,19 +1702,28 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         } else if (pt_in_rect(x, y, R_BTN_CH_NONE)) {
             if (is_busy) return 0;
             g_PressedBtn = 10;
-            g_cfg.chain_type = CHAIN_NONE;
+            {
+                std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
+                g_cfg.chain_type = CHAIN_NONE;
+            }
             g_SegTargetX = 27.0f;
             save_config_ini();
         } else if (pt_in_rect(x, y, R_BTN_CH_SOCKS5)) {
             if (is_busy) return 0;
             g_PressedBtn = 11;
-            g_cfg.chain_type = CHAIN_SOCKS5;
+            {
+                std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
+                g_cfg.chain_type = CHAIN_SOCKS5;
+            }
             g_SegTargetX = 143.0f;
             save_config_ini();
         } else if (pt_in_rect(x, y, R_BTN_CH_HTTP)) {
             if (is_busy) return 0;
             g_PressedBtn = 12;
-            g_cfg.chain_type = CHAIN_HTTP;
+            {
+                std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
+                g_cfg.chain_type = CHAIN_HTTP;
+            }
             g_SegTargetX = 259.0f;
             save_config_ini();
         } else if (pt_in_rect(x, y, R_BTN_PASTE_CH)) {
@@ -1705,12 +1731,16 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             g_PressedBtn = 8;
             std::string clip = read_clipboard_text(hwnd);
             if (!clip.empty()) {
-                if (clip.rfind("socks5://", 0) == 0) { g_cfg.chain_type = CHAIN_SOCKS5; g_SegTargetX = 143.0f; clip = clip.substr(9); }
-                else if (clip.rfind("http://", 0) == 0) { g_cfg.chain_type = CHAIN_HTTP; g_SegTargetX = 259.0f; clip = clip.substr(7); }
-                size_t at = clip.find('@');
-                if (at != std::string::npos) { g_cfg.chain_auth_str = clip.substr(0, at); g_cfg.chain_addr_str = clip.substr(at + 1); }
-                else g_cfg.chain_addr_str = clip;
-                sync_chain_fields(); save_config_ini(); set_status_msg("Updated upstream proxy from clipboard");
+                {
+                    std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
+                    if (clip.rfind("socks5://", 0) == 0) { g_cfg.chain_type = CHAIN_SOCKS5; g_SegTargetX = 143.0f; clip = clip.substr(9); }
+                    else if (clip.rfind("http://", 0) == 0) { g_cfg.chain_type = CHAIN_HTTP; g_SegTargetX = 259.0f; clip = clip.substr(7); }
+                    size_t at = clip.find('@');
+                    if (at != std::string::npos) { g_cfg.chain_auth_str = clip.substr(0, at); g_cfg.chain_addr_str = clip.substr(at + 1); }
+                    else g_cfg.chain_addr_str = clip;
+                    sync_chain_fields();
+                }
+                save_config_ini(); set_status_msg("Updated upstream proxy from clipboard");
             }
         } else if (pt_in_rect(x, y, R_BTN_FLUSHDNS)) {
             g_PressedBtn = 4;
@@ -1739,6 +1769,7 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         TunnelState st = g_State.load();
         if (st == STATE_CONNECTED || st == STATE_CONNECTING) return 0;
         if (g_FocusField == FIELD_NONE) return 0;
+        std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
         std::string* target = get_field_string(g_FocusField);
         if (!target) return 0;
         bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -1896,6 +1927,7 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         TunnelState st = g_State.load();
         if (st == STATE_CONNECTED || st == STATE_CONNECTING) return 0;
         if (g_FocusField == FIELD_NONE) return 0;
+        std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
         std::string* target = get_field_string(g_FocusField);
         if (!target) return 0;
         if (wParam == VK_BACK) {

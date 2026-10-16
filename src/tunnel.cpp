@@ -68,6 +68,7 @@ static WINTUN_SESSION_HANDLE    g_Session     = nullptr;
 static SOCKET                   g_ListenSock  = INVALID_SOCKET;
 static std::mutex               g_TunTxMutex;
 static std::atomic<bool>        g_TunnelRun{ false };
+static std::atomic<uint64_t>    g_tunnel_epoch{ 0 };
 static AppConfig                g_active_cfg;
 static std::atomic<DWORD>       g_master_thread_id{ 0 };
 static DWORD                    g_PhysIfIndex = 0;
@@ -556,14 +557,22 @@ static ITransportStream* dial_vless_transport(bool enable_vision = false, const 
 }
 
 
-struct SessionArgs { SOCKET client_sock; uint32_t orig_dst_ip; uint16_t orig_dst_port; };
-struct PipeStreamArgs { ITransportStream* v_stream; SOCKET c_sock; bool is_vless; };
+struct SessionArgs { SOCKET client_sock; uint32_t orig_dst_ip; uint16_t orig_dst_port; uint64_t epoch; };
+struct PipeStreamArgs {
+    ITransportStream* v_stream;
+    SOCKET c_sock;
+    bool is_vless;
+    std::shared_ptr<std::atomic<ULONGLONG>> last_act;
+    uint64_t epoch;
+};
 
 static unsigned __stdcall downlink_worker(void* arg) {
     PipeStreamArgs* p = static_cast<PipeStreamArgs*>(arg);
     ITransportStream* v_stream = p->v_stream;
     SOCKET c_sock = p->c_sock;
     bool is_vless = p->is_vless;
+    std::shared_ptr<std::atomic<ULONGLONG>> last_act = p->last_act;
+    uint64_t epoch = p->epoch;
     delete p;
 
     if (is_vless) {
@@ -583,9 +592,10 @@ static unsigned __stdcall downlink_worker(void* arg) {
     }
 
     char buf[65536];
-    while (g_TunnelRun) {
+    while (g_TunnelRun && g_tunnel_epoch.load() == epoch) {
         int n = v_stream->recv_some(buf, sizeof(buf));
         if (n <= 0) break;
+        if (last_act) last_act->store(GetTickCount64(), std::memory_order_relaxed);
         g_TotalRx += n;
         if (!send_all(c_sock, buf, n)) break;
     }
@@ -595,7 +605,8 @@ static unsigned __stdcall downlink_worker(void* arg) {
 
 static unsigned __stdcall tcp_session_thread(void* arg) {
     SessionArgs* sa = static_cast<SessionArgs*>(arg);
-    SOCKET c_sock = sa->client_sock; uint32_t dst_ip = sa->orig_dst_ip; uint16_t dst_port = sa->orig_dst_port; delete sa;
+    SOCKET c_sock = sa->client_sock; uint32_t dst_ip = sa->orig_dst_ip; uint16_t dst_port = sa->orig_dst_port; uint64_t epoch = sa->epoch; delete sa;
+    if (!g_TunnelRun || g_tunnel_epoch.load() != epoch) { closesocket(c_sock); return 0; }
     BOOL nodelay = TRUE;
     setsockopt(c_sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
     int buf_sz = 262144;
@@ -647,28 +658,29 @@ static unsigned __stdcall tcp_session_thread(void* arg) {
     }
 
     bool is_vless_downlink = (g_active_cfg.vless_valid && g_active_cfg.outbound_proto == PROTO_VLESS);
-    uintptr_t hDown = _beginthreadex(nullptr, 65536, downlink_worker, new PipeStreamArgs{ stream, c_sock, is_vless_downlink }, 0, nullptr);
+    auto last_act = std::make_shared<std::atomic<ULONGLONG>>(GetTickCount64());
+    uintptr_t hDown = _beginthreadex(nullptr, 65536, downlink_worker, new PipeStreamArgs{ stream, c_sock, is_vless_downlink, last_act, epoch }, 0, nullptr);
 
     DWORD tv_c = 2000;
     setsockopt(c_sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv_c), sizeof(tv_c));
 
     char buf[65536];
-    ULONGLONG last_act = GetTickCount64();
-    while (g_TunnelRun) {
+    while (g_TunnelRun && g_tunnel_epoch.load() == epoch) {
         int n = recv(c_sock, buf, sizeof(buf), 0);
         if (n <= 0) {
             if (n < 0 && WSAGetLastError() == WSAETIMEDOUT) {
+                if (g_tunnel_epoch.load() != epoch) break;
                 if (hDown && WaitForSingleObject(reinterpret_cast<HANDLE>(hDown), 0) == WAIT_OBJECT_0) {
                     break;
                 }
-                if (GetTickCount64() - last_act >= 120000) {
+                if (GetTickCount64() - last_act->load(std::memory_order_relaxed) >= 300000) {
                     break;
                 }
                 continue;
             }
             break;
         }
-        last_act = GetTickCount64();
+        last_act->store(GetTickCount64(), std::memory_order_relaxed);
         g_TotalTx += n;
         if (!stream->send_all(buf, n)) break;
     }
@@ -677,9 +689,10 @@ static unsigned __stdcall tcp_session_thread(void* arg) {
     shutdown(c_sock, SD_RECEIVE);
 
     if (hDown) {
-        for (int i = 0; i < 10 && g_TunnelRun; ++i) {
-            DWORD wr = WaitForSingleObject(reinterpret_cast<HANDLE>(hDown), 100);
+        while (g_TunnelRun && g_tunnel_epoch.load() == epoch) {
+            DWORD wr = WaitForSingleObject(reinterpret_cast<HANDLE>(hDown), 500);
             if (wr == WAIT_OBJECT_0) break;
+            if (GetTickCount64() - last_act->load(std::memory_order_relaxed) >= 60000) break;
         }
         stream->close();
         shutdown(c_sock, SD_BOTH);
@@ -839,15 +852,25 @@ struct UdpNatSession {
     uint32_t dst_ip;        // network byte order
     uint16_t dst_port;      // network byte order
     ITransportStream* v_stream = nullptr;
-    std::mutex send_mtx;
+    std::mutex stream_mtx;
     std::atomic<bool> alive{ true };
     ULONGLONG last_tick = 0;
     uint64_t session_key = 0;
+    uint64_t epoch = 0;
+
+    void close_stream() {
+        alive.store(false);
+        std::lock_guard<std::mutex> lk(stream_mtx);
+        if (v_stream) {
+            v_stream->close();
+        }
+    }
 };
 
 struct UdpInitArgs {
     std::shared_ptr<UdpNatSession> session;
     std::vector<uint8_t> first_payload;
+    uint64_t epoch;
 };
 
 static std::mutex g_udp_table_mtx;
@@ -863,7 +886,16 @@ static unsigned __stdcall udp_session_worker(void* arg) {
     auto* args = static_cast<UdpInitArgs*>(arg);
     auto sess = args->session;
     std::vector<uint8_t> first_data = std::move(args->first_payload);
+    uint64_t epoch = args->epoch;
     delete args;
+
+    if (!g_TunnelRun || g_tunnel_epoch.load() != epoch) {
+        sess->alive.store(false);
+        std::lock_guard<std::mutex> lk(g_udp_table_mtx);
+        auto it = g_udp_map.find(sess->session_key);
+        if (it != g_udp_map.end() && it->second == sess) g_udp_map.erase(it);
+        return 0;
+    }
 
     ITransportStream* v_stream = dial_vless_transport(false);
     if (!v_stream) {
@@ -894,7 +926,7 @@ static unsigned __stdcall udp_session_worker(void* arg) {
     }
 
     {
-        std::lock_guard<std::mutex> lk(sess->send_mtx);
+        std::lock_guard<std::mutex> lk(sess->stream_mtx);
         sess->v_stream = v_stream;
         g_TotalTx += first_data.size();
         if (!v_stream->send_all(init_pkt.data(), static_cast<int>(init_pkt.size()))) {
@@ -912,8 +944,11 @@ static unsigned __stdcall udp_session_worker(void* arg) {
         uint8_t v_resp[2];
         if (!v_stream->recv_exact(v_resp, 2)) {
             sess->alive.store(false);
-            delete v_stream;
-            sess->v_stream = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(sess->stream_mtx);
+                delete v_stream;
+                sess->v_stream = nullptr;
+            }
             std::lock_guard<std::mutex> lk2(g_udp_table_mtx);
             auto it = g_udp_map.find(sess->session_key);
             if (it != g_udp_map.end() && it->second == sess) g_udp_map.erase(it);
@@ -923,8 +958,11 @@ static unsigned __stdcall udp_session_worker(void* arg) {
             uint8_t addons[256];
             if (!v_stream->recv_exact(addons, v_resp[1])) {
                 sess->alive.store(false);
-                delete v_stream;
-                sess->v_stream = nullptr;
+                {
+                    std::lock_guard<std::mutex> lk(sess->stream_mtx);
+                    delete v_stream;
+                    sess->v_stream = nullptr;
+                }
                 std::lock_guard<std::mutex> lk2(g_udp_table_mtx);
                 auto it = g_udp_map.find(sess->session_key);
                 if (it != g_udp_map.end() && it->second == sess) g_udp_map.erase(it);
@@ -934,7 +972,8 @@ static unsigned __stdcall udp_session_worker(void* arg) {
     }
 
     uint32_t tun_ip_net = inet_addr(g_active_cfg.tun_ip_str);
-    while (g_TunnelRun && sess->alive.load()) {
+    ULONGLONG udp_timeout = (sess->dst_port == htons(53)) ? 5000 : 30000;
+    while (g_TunnelRun && sess->alive.load() && g_tunnel_epoch.load() == epoch) {
         uint16_t dlen = 0;
         uint32_t src_ip_resp = sess->dst_ip;
         uint16_t src_port_resp = sess->dst_port;
@@ -942,7 +981,7 @@ static unsigned __stdcall udp_session_worker(void* arg) {
         if (g_active_cfg.outbound_proto == PROTO_TROJAN) {
             uint8_t atyp = 0;
             if (!v_stream->recv_exact(&atyp, 1)) {
-                if (WSAGetLastError() == WSAETIMEDOUT && (GetTickCount64() - sess->last_tick < 12000)) continue;
+                if (WSAGetLastError() == WSAETIMEDOUT && (GetTickCount64() - sess->last_tick < udp_timeout)) continue;
                 break;
             }
             if (atyp == 0x01) { // IPv4
@@ -976,7 +1015,7 @@ static unsigned __stdcall udp_session_worker(void* arg) {
         } else {
             uint8_t len_bytes[2];
             if (!v_stream->recv_exact(len_bytes, 2)) {
-                if (WSAGetLastError() == WSAETIMEDOUT && (GetTickCount64() - sess->last_tick < 12000)) continue;
+                if (WSAGetLastError() == WSAETIMEDOUT && (GetTickCount64() - sess->last_tick < udp_timeout)) continue;
                 break;
             }
             dlen = (static_cast<uint16_t>(len_bytes[0]) << 8) | len_bytes[1];
@@ -1017,7 +1056,7 @@ static unsigned __stdcall udp_session_worker(void* arg) {
 
     sess->alive.store(false);
     {
-        std::lock_guard<std::mutex> lk(sess->send_mtx);
+        std::lock_guard<std::mutex> lk(sess->stream_mtx);
         delete v_stream;
         sess->v_stream = nullptr;
     }
@@ -1035,17 +1074,17 @@ static void handle_udp_packet(uint16_t src_port_net, uint32_t dst_ip, uint16_t d
     uint64_t key = make_udp_key(src_port_net, dst_ip, dst_port_net);
     std::shared_ptr<UdpNatSession> sess;
     ULONGLONG now = GetTickCount64();
+    uint64_t cur_epoch = g_tunnel_epoch.load();
 
     {
         std::lock_guard<std::mutex> lk(g_udp_table_mtx);
         static ULONGLONG s_last_reap = 0;
         if (now - s_last_reap >= 3000) {
             s_last_reap = now;
-            ULONGLONG timeout_thresh = (g_udp_map.size() > 40) ? 5000 : 12000;
             for (auto it = g_udp_map.begin(); it != g_udp_map.end(); ) {
-                if (!it->second->alive.load() || (now - it->second->last_tick >= timeout_thresh)) {
-                    it->second->alive.store(false);
-                    if (it->second->v_stream) it->second->v_stream->close();
+                ULONGLONG timeout_thresh = (it->second->dst_port == htons(53)) ? 5000 : 30000;
+                if (!it->second->alive.load() || it->second->epoch != cur_epoch || (now - it->second->last_tick >= timeout_thresh)) {
+                    it->second->close_stream();
                     it = g_udp_map.erase(it);
                 } else {
                     ++it;
@@ -1056,8 +1095,8 @@ static void handle_udp_packet(uint16_t src_port_net, uint32_t dst_ip, uint16_t d
         auto it = g_udp_map.find(key);
         if (it != g_udp_map.end()) {
             sess = it->second;
-            if (!sess->alive.load()) {
-                if (sess->v_stream) sess->v_stream->close();
+            if (!sess->alive.load() || sess->epoch != cur_epoch) {
+                sess->close_stream();
                 g_udp_map.erase(it);
                 sess.reset();
             }
@@ -1072,20 +1111,21 @@ static void handle_udp_packet(uint16_t src_port_net, uint32_t dst_ip, uint16_t d
             sess->alive.store(true);
             sess->last_tick = now;
             sess->session_key = key;
+            sess->epoch = cur_epoch;
             g_udp_map[key] = sess;
 
-            UdpInitArgs* args = new UdpInitArgs{ sess, std::vector<uint8_t>(payload, payload + payload_len) };
+            UdpInitArgs* args = new UdpInitArgs{ sess, std::vector<uint8_t>(payload, payload + payload_len), cur_epoch };
             uintptr_t h = _beginthreadex(nullptr, 65536, udp_session_worker, args, 0, nullptr);
             if (h) CloseHandle(reinterpret_cast<HANDLE>(h));
             return;
         }
     }
 
-    if (sess && sess->alive.load() && sess->v_stream) {
-        std::lock_guard<std::mutex> lk(sess->send_mtx);
+    if (sess && sess->alive.load() && sess->epoch == cur_epoch) {
+        std::lock_guard<std::mutex> lk(sess->stream_mtx);
         if (sess->alive.load() && sess->v_stream) {
             uint8_t buf[2048];
-            if (g_cfg.outbound_proto == PROTO_TROJAN) {
+            if (g_active_cfg.outbound_proto == PROTO_TROJAN) {
                 if (payload_len + 11 <= sizeof(buf)) {
                     int tlen = build_trojan_udp_packet(buf, sess->dst_ip, sess->dst_port, payload, payload_len);
                     g_TotalTx += payload_len;
@@ -1098,7 +1138,8 @@ static void handle_udp_packet(uint16_t src_port_net, uint32_t dst_ip, uint16_t d
             } else {
                 uint16_t len_net = htons(payload_len);
                 if (payload_len + 2 <= sizeof(buf)) {
-                    std::memcpy(buf, &len_net, 2);
+                    buf[0] = static_cast<uint8_t>((len_net >> 8) & 0xFF);
+                    buf[1] = static_cast<uint8_t>(len_net & 0xFF);
                     std::memcpy(buf + 2, payload, payload_len);
                     g_TotalTx += payload_len;
                     if (!sess->v_stream->send_all(buf, payload_len + 2)) {
@@ -1125,7 +1166,7 @@ static unsigned __stdcall tcp_listener_thread(void* arg) {
             closesocket(c_sock); continue;
         }
         log_msg("tcp_listener: ACCEPT port %u -> target %s:%u", c_port, mask_ip(entry.orig_dst_ip).c_str(), ntohs(entry.orig_dst_port));
-        uintptr_t h = _beginthreadex(nullptr, 65536, tcp_session_thread, new SessionArgs{ c_sock, entry.orig_dst_ip, entry.orig_dst_port }, 0, nullptr);
+        uintptr_t h = _beginthreadex(nullptr, 65536, tcp_session_thread, new SessionArgs{ c_sock, entry.orig_dst_ip, entry.orig_dst_port, g_tunnel_epoch.load() }, 0, nullptr);
         if (h) CloseHandle(reinterpret_cast<HANDLE>(h));
     }
     return 0;
@@ -1289,6 +1330,7 @@ static HANDLE g_hMasterThread = nullptr;
 static std::mutex g_master_thread_mtx;
 
 void stop_tunnel(bool is_failure, const std::string& fail_msg) {
+    g_tunnel_epoch.fetch_add(1);
     g_TunnelRun = false;
     log_msg("Stopping tunnel... (is_failure=%d)", is_failure);
     if (g_ListenSock != INVALID_SOCKET) { closesocket(g_ListenSock); g_ListenSock = INVALID_SOCKET; }
@@ -1319,8 +1361,7 @@ void stop_tunnel(bool is_failure, const std::string& fail_msg) {
         std::lock_guard<std::mutex> lk(g_udp_table_mtx);
         for (auto& pair : g_udp_map) {
             if (pair.second) {
-                pair.second->alive.store(false);
-                if (pair.second->v_stream) pair.second->v_stream->close();
+                pair.second->close_stream();
             }
         }
         g_udp_map.clear();
@@ -1374,10 +1415,8 @@ void stop_tunnel(bool is_failure, const std::string& fail_msg) {
         g_State = STATE_FAILED;
         if (!fail_msg.empty()) set_status_msg(fail_msg);
     } else {
-        if (g_State.load() != STATE_FAILED) {
-            g_State = STATE_DISCONNECTED;
-            set_status_msg("Tunnel stopped & system routes restored");
-        }
+        g_State = STATE_DISCONNECTED;
+        set_status_msg("Tunnel stopped & system routes restored");
     }
     g_LastPingMs = PING_IDLE;
     EmptyWorkingSet(GetCurrentProcess());
@@ -1390,6 +1429,7 @@ void stop_tunnel(bool is_failure, const std::string& fail_msg) {
 static std::atomic<bool> g_StartingTunnel{ false };
 
 static unsigned __stdcall tunnel_master_thread(void*) {
+    uint64_t my_epoch = g_tunnel_epoch.load();
     g_master_thread_id.store(GetCurrentThreadId());
     struct TunnelMasterGuard {
         ~TunnelMasterGuard() {
@@ -1688,7 +1728,7 @@ static unsigned __stdcall tunnel_master_thread(void*) {
         WintunReleaseReceivePacket(g_Session, pkt);
     }
 
-    if (g_TunnelRun) {
+    if (g_TunnelRun && g_tunnel_epoch.load() == my_epoch) {
         log_msg("Wintun packet loop exited unexpectedly (error=%lu). Stopping tunnel to restore routes.", GetLastError());
         stop_tunnel();
     }
@@ -1699,6 +1739,7 @@ void start_tunnel_async() {
     if (g_State.load() == STATE_CONNECTED || g_State.load() == STATE_CONNECTING) return;
     bool expected = false;
     if (!g_StartingTunnel.compare_exchange_strong(expected, true)) return;
+    g_tunnel_epoch.fetch_add(1);
     g_TunnelRun = true;
     std::lock_guard<std::mutex> lk(g_master_thread_mtx);
     if (g_hMasterThread) {

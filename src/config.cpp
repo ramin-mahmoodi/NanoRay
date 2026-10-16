@@ -180,6 +180,11 @@ bool parse_vless_uri(const std::string& uri_in) {
     }
 
     if (g_cfg.vless_type == "splithttp") g_cfg.vless_type = "xhttp";
+    if (g_cfg.vless_type == "grpc" || g_cfg.vless_type == "quic") {
+        g_cfg.vless_valid = false;
+        set_status_msg("Error: Unsupported transport '" + g_cfg.vless_type + "' (only tcp, ws, xhttp, httpupgrade supported)");
+        return false;
+    }
     if (g_cfg.vless_sni.empty()) g_cfg.vless_sni = host;
     if (g_cfg.vless_host.empty()) g_cfg.vless_host = g_cfg.vless_sni;
     if (g_cfg.vless_path.empty()) g_cfg.vless_path = "/";

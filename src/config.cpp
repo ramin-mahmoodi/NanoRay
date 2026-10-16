@@ -247,13 +247,23 @@ static std::string get_ini_path() {
 }
 
 void save_config_ini() {
-    std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
+    std::string uri, addr, auth;
+    int ctype;
+    bool dark;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
+        uri = g_cfg.raw_vless_uri;
+        ctype = static_cast<int>(g_cfg.chain_type);
+        addr = g_cfg.chain_addr_str;
+        auth = g_cfg.chain_auth_str;
+        dark = g_cfg.is_dark_mode;
+    }
     std::string ini = get_ini_path();
-    WritePrivateProfileStringA("VLESS", "URI", g_cfg.raw_vless_uri.c_str(), ini.c_str());
-    WritePrivateProfileStringA("CHAIN", "Type", std::to_string(static_cast<int>(g_cfg.chain_type)).c_str(), ini.c_str());
-    WritePrivateProfileStringA("CHAIN", "Addr", g_cfg.chain_addr_str.c_str(), ini.c_str());
-    WritePrivateProfileStringA("CHAIN", "Auth", g_cfg.chain_auth_str.c_str(), ini.c_str());
-    WritePrivateProfileStringA("UI", "DarkMode", g_cfg.is_dark_mode ? "1" : "0", ini.c_str());
+    WritePrivateProfileStringA("VLESS", "URI", uri.c_str(), ini.c_str());
+    WritePrivateProfileStringA("CHAIN", "Type", std::to_string(ctype).c_str(), ini.c_str());
+    WritePrivateProfileStringA("CHAIN", "Addr", addr.c_str(), ini.c_str());
+    WritePrivateProfileStringA("CHAIN", "Auth", auth.c_str(), ini.c_str());
+    WritePrivateProfileStringA("UI", "DarkMode", dark ? "1" : "0", ini.c_str());
 }
 
 void load_config_ini() {

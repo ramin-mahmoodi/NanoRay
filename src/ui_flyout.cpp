@@ -1087,10 +1087,6 @@ static void render_flyout_graphics(Graphics& g, float scale, bool is_dark) {
                 if (s == "reality") proto_name = is_vision ? base_proto + L" · HTTPUPGRADE+REALITY+VISION (basic)" : base_proto + L" · HTTPUPGRADE+REALITY";
                 else if (s == "tls") proto_name = base_proto + L" · HTTPUPGRADE+TLS";
                 else proto_name = base_proto + L" · HTTPUPGRADE";
-            } else if (t == "grpc") {
-                if (s == "reality") proto_name = is_vision ? base_proto + L" · GRPC+REALITY+VISION (basic)" : base_proto + L" · GRPC+REALITY";
-                else if (s == "tls") proto_name = base_proto + L" · GRPC+TLS";
-                else proto_name = base_proto + L" · GRPC";
             } else {
                 if (s == "reality") proto_name = is_vision ? base_proto + L" · TCP+REALITY+VISION (basic)" : base_proto + L" · TCP+REALITY";
                 else if (s == "tls") proto_name = is_vision ? base_proto + L" · TCP+TLS+VISION (basic)" : base_proto + L" · TCP+TLS";

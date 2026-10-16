@@ -67,9 +67,19 @@ static WINTUN_ADAPTER_HANDLE    g_Adapter     = nullptr;
 static WINTUN_SESSION_HANDLE    g_Session     = nullptr;
 static SOCKET                   g_ListenSock  = INVALID_SOCKET;
 static std::mutex               g_TunTxMutex;
-static std::atomic<bool>        g_TunnelRun{ false };
-static std::atomic<uint64_t>    g_tunnel_epoch{ 0 };
-static AppConfig                g_active_cfg;
+static std::atomic<bool>                 g_TunnelRun{ false };
+static std::atomic<uint64_t>             g_tunnel_epoch{ 0 };
+static std::mutex                        g_active_cfg_mtx;
+static std::shared_ptr<const AppConfig>  g_active_cfg;
+
+static std::shared_ptr<const AppConfig> get_active_cfg() {
+    std::lock_guard<std::mutex> lk(g_active_cfg_mtx);
+    return g_active_cfg;
+}
+static void set_active_cfg(std::shared_ptr<const AppConfig> cfg) {
+    std::lock_guard<std::mutex> lk(g_active_cfg_mtx);
+    g_active_cfg = std::move(cfg);
+}
 static std::atomic<DWORD>       g_master_thread_id{ 0 };
 static DWORD                    g_PhysIfIndex = 0;
 static std::string              g_PhysGateway = "";
@@ -366,7 +376,9 @@ static std::string base64_encode(const std::string& in) {
 }
 
 static SOCKET create_outbound_socket(const char* target_ip, uint16_t target_port, int timeout_ms = 6000, const AppConfig* pcfg = nullptr) {
-    const AppConfig& cfg = pcfg ? *pcfg : g_active_cfg;
+    auto sp = pcfg ? nullptr : get_active_cfg();
+    if (!pcfg && !sp) return INVALID_SOCKET;
+    const AppConfig& cfg = pcfg ? *pcfg : *sp;
     if (!target_ip || target_ip[0] == '\0' || target_port == 0) return INVALID_SOCKET;
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return INVALID_SOCKET;
@@ -425,7 +437,9 @@ static std::string resolve_to_ip_str(const std::string& host) {
 }
 
 static SOCKET dial_proxy_to_dest(uint32_t target_ip_net, uint16_t target_port_net, const AppConfig* pcfg = nullptr) {
-    const AppConfig& cfg = pcfg ? *pcfg : g_active_cfg;
+    auto sp = pcfg ? nullptr : get_active_cfg();
+    if (!pcfg && !sp) return INVALID_SOCKET;
+    const AppConfig& cfg = pcfg ? *pcfg : *sp;
     if (cfg.chain_type == CHAIN_NONE) return INVALID_SOCKET;
 
     SOCKET s = create_outbound_socket(cfg.chain_ip.c_str(), cfg.chain_port, 6000, &cfg);
@@ -476,7 +490,9 @@ static SOCKET dial_proxy_to_dest(uint32_t target_ip_net, uint16_t target_port_ne
 }
 
 static SOCKET dial_vless_tunnel(const AppConfig* pcfg = nullptr) {
-    const AppConfig& cfg = pcfg ? *pcfg : g_active_cfg;
+    auto sp = pcfg ? nullptr : get_active_cfg();
+    if (!pcfg && !sp) return INVALID_SOCKET;
+    const AppConfig& cfg = pcfg ? *pcfg : *sp;
     if (!cfg.vless_valid) return INVALID_SOCKET;
     if (cfg.chain_type == CHAIN_NONE) return create_outbound_socket(cfg.vless_ip.c_str(), cfg.vless_port, 6000, &cfg);
 
@@ -490,7 +506,9 @@ static SOCKET dial_vless_tunnel(const AppConfig* pcfg = nullptr) {
 }
 
 static ITransportStream* dial_vless_transport(bool enable_vision = false, const AppConfig* pcfg = nullptr) {
-    const AppConfig& cfg = pcfg ? *pcfg : g_active_cfg;
+    auto sp = pcfg ? nullptr : get_active_cfg();
+    if (!pcfg && !sp) return nullptr;
+    const AppConfig& cfg = pcfg ? *pcfg : *sp;
     if (!cfg.vless_valid) return nullptr;
     SOCKET s = dial_vless_tunnel(&cfg);
     if (s == INVALID_SOCKET) return nullptr;
@@ -557,7 +575,13 @@ static ITransportStream* dial_vless_transport(bool enable_vision = false, const 
 }
 
 
-struct SessionArgs { SOCKET client_sock; uint32_t orig_dst_ip; uint16_t orig_dst_port; uint64_t epoch; };
+struct SessionArgs {
+    SOCKET client_sock;
+    uint32_t orig_dst_ip;
+    uint16_t orig_dst_port;
+    uint64_t epoch;
+    std::shared_ptr<const AppConfig> cfg;
+};
 struct PipeStreamArgs {
     ITransportStream* v_stream;
     SOCKET c_sock;
@@ -605,8 +629,11 @@ static unsigned __stdcall downlink_worker(void* arg) {
 
 static unsigned __stdcall tcp_session_thread(void* arg) {
     SessionArgs* sa = static_cast<SessionArgs*>(arg);
-    SOCKET c_sock = sa->client_sock; uint32_t dst_ip = sa->orig_dst_ip; uint16_t dst_port = sa->orig_dst_port; uint64_t epoch = sa->epoch; delete sa;
-    if (!g_TunnelRun || g_tunnel_epoch.load() != epoch) { closesocket(c_sock); return 0; }
+    SOCKET c_sock = sa->client_sock; uint32_t dst_ip = sa->orig_dst_ip; uint16_t dst_port = sa->orig_dst_port; uint64_t epoch = sa->epoch;
+    std::shared_ptr<const AppConfig> cfg_sp = sa->cfg ? sa->cfg : get_active_cfg();
+    delete sa;
+    if (!g_TunnelRun || g_tunnel_epoch.load() != epoch || !cfg_sp) { closesocket(c_sock); return 0; }
+    const AppConfig& cfg = *cfg_sp;
     BOOL nodelay = TRUE;
     setsockopt(c_sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
     int buf_sz = 262144;
@@ -614,10 +641,10 @@ static unsigned __stdcall tcp_session_thread(void* arg) {
     setsockopt(c_sock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&buf_sz), sizeof(buf_sz));
 
     ITransportStream* stream = nullptr;
-    if (g_active_cfg.vless_valid) {
-        stream = dial_vless_transport(g_active_cfg.outbound_proto == PROTO_VLESS && g_active_cfg.vless_flow == "xtls-rprx-vision");
-    } else if (g_active_cfg.chain_type != CHAIN_NONE) {
-        SOCKET p_sock = dial_proxy_to_dest(dst_ip, dst_port);
+    if (cfg.vless_valid) {
+        stream = dial_vless_transport(cfg.outbound_proto == PROTO_VLESS && cfg.vless_flow == "xtls-rprx-vision", &cfg);
+    } else if (cfg.chain_type != CHAIN_NONE) {
+        SOCKET p_sock = dial_proxy_to_dest(dst_ip, dst_port, &cfg);
         if (p_sock != INVALID_SOCKET) {
             setsockopt(p_sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
             setsockopt(p_sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&buf_sz), sizeof(buf_sz));
@@ -627,13 +654,13 @@ static unsigned __stdcall tcp_session_thread(void* arg) {
     }
     if (!stream) { closesocket(c_sock); return 0; }
 
-    if (g_active_cfg.vless_valid) {
+    if (cfg.vless_valid) {
         uint8_t first_pkt[16384];
         int hdr_len = 0;
-        if (g_active_cfg.outbound_proto == PROTO_TROJAN) {
-            hdr_len = build_trojan_header(first_pkt, 0x01, dst_ip, dst_port, g_active_cfg.trojan_hash_hex);
+        if (cfg.outbound_proto == PROTO_TROJAN) {
+            hdr_len = build_trojan_header(first_pkt, 0x01, dst_ip, dst_port, cfg.trojan_hash_hex);
         } else {
-            hdr_len = build_vless_header(first_pkt, 0x01, dst_ip, dst_port, g_active_cfg.vless_uuid, g_active_cfg.vless_flow);
+            hdr_len = build_vless_header(first_pkt, 0x01, dst_ip, dst_port, cfg.vless_uuid, cfg.vless_flow);
         }
         u_long available = 0;
         int initial_payload = 0;
@@ -657,7 +684,7 @@ static unsigned __stdcall tcp_session_thread(void* arg) {
         }
     }
 
-    bool is_vless_downlink = (g_active_cfg.vless_valid && g_active_cfg.outbound_proto == PROTO_VLESS);
+    bool is_vless_downlink = (cfg.vless_valid && cfg.outbound_proto == PROTO_VLESS);
     auto last_act = std::make_shared<std::atomic<ULONGLONG>>(GetTickCount64());
     uintptr_t hDown = _beginthreadex(nullptr, 65536, downlink_worker, new PipeStreamArgs{ stream, c_sock, is_vless_downlink, last_act, epoch }, 0, nullptr);
 
@@ -673,7 +700,7 @@ static unsigned __stdcall tcp_session_thread(void* arg) {
                 if (hDown && WaitForSingleObject(reinterpret_cast<HANDLE>(hDown), 0) == WAIT_OBJECT_0) {
                     break;
                 }
-                if (GetTickCount64() - last_act->load(std::memory_order_relaxed) >= 300000) {
+                if (GetTickCount64() - last_act->load(std::memory_order_relaxed) >= 1800000) {
                     break;
                 }
                 continue;
@@ -708,7 +735,12 @@ static unsigned __stdcall tcp_session_thread(void* arg) {
 }
 
 static std::atomic<int> g_active_dns_workers{ 0 };
-struct DnsJob { uint32_t src_ip, dst_ip; uint16_t src_port, dst_port, payload_len; uint8_t payload[1500]; };
+struct DnsJob {
+    uint32_t src_ip, dst_ip;
+    uint16_t src_port, dst_port, payload_len;
+    std::shared_ptr<const AppConfig> cfg;
+    uint8_t payload[1500];
+};
 
 static unsigned __stdcall dns_hijack_worker(void* arg) {
     struct DnsWorkerGuard {
@@ -716,6 +748,9 @@ static unsigned __stdcall dns_hijack_worker(void* arg) {
     } guard;
     DnsJob* job = static_cast<DnsJob*>(arg);
     if (!job) return 0;
+    std::shared_ptr<const AppConfig> cfg_sp = job->cfg ? job->cfg : get_active_cfg();
+    if (!cfg_sp) { delete job; return 0; }
+    const AppConfig& cfg = *cfg_sp;
 
     // Fast DNS cache lookup (serves frequent queries in 0.05ms)
     if (job->payload_len >= 12) {
@@ -764,10 +799,10 @@ static unsigned __stdcall dns_hijack_worker(void* arg) {
 
     log_msg("dns_hijack: intercepted DNS query len=%u from port %u", job->payload_len, ntohs(job->src_port));
     ITransportStream* stream = nullptr;
-    if (g_active_cfg.vless_valid) {
-        stream = dial_vless_transport();
-    } else if (g_active_cfg.chain_type != CHAIN_NONE) {
-        SOCKET s = dial_proxy_to_dest(inet_addr("1.1.1.1"), htons(53));
+    if (cfg.vless_valid) {
+        stream = dial_vless_transport(false, &cfg);
+    } else if (cfg.chain_type != CHAIN_NONE) {
+        SOCKET s = dial_proxy_to_dest(inet_addr("1.1.1.1"), htons(53), &cfg);
         if (s != INVALID_SOCKET) stream = new TcpStream(s, true);
     }
 
@@ -775,11 +810,11 @@ static unsigned __stdcall dns_hijack_worker(void* arg) {
         stream->set_rcv_timeout(3500);
         uint8_t pkt[2048];
         int offset = 0;
-        if (g_active_cfg.vless_valid) {
-            if (g_active_cfg.outbound_proto == PROTO_TROJAN) {
-                offset = build_trojan_header(pkt, 0x01, inet_addr("1.1.1.1"), htons(53), g_active_cfg.trojan_hash_hex);
+        if (cfg.vless_valid) {
+            if (cfg.outbound_proto == PROTO_TROJAN) {
+                offset = build_trojan_header(pkt, 0x01, inet_addr("1.1.1.1"), htons(53), cfg.trojan_hash_hex);
             } else {
-                offset = build_vless_header(pkt, 0x01, inet_addr("1.1.1.1"), htons(53), g_active_cfg.vless_uuid, g_active_cfg.vless_flow);
+                offset = build_vless_header(pkt, 0x01, inet_addr("1.1.1.1"), htons(53), cfg.vless_uuid, cfg.vless_flow);
             }
         }
         uint16_t tcp_dns_len = htons(job->payload_len);
@@ -788,7 +823,7 @@ static unsigned __stdcall dns_hijack_worker(void* arg) {
         g_TotalTx += job->payload_len;
         if (stream->send_all(pkt, offset + 2 + job->payload_len)) {
             bool ok = true;
-            if (g_active_cfg.vless_valid && g_active_cfg.outbound_proto == PROTO_VLESS) {
+            if (cfg.vless_valid && cfg.outbound_proto == PROTO_VLESS) {
                 uint8_t v_resp[2];
                 if (!stream->recv_exact(v_resp, 2)) ok = false;
                 else if (v_resp[1] > 0) {
@@ -857,6 +892,7 @@ struct UdpNatSession {
     ULONGLONG last_tick = 0;
     uint64_t session_key = 0;
     uint64_t epoch = 0;
+    std::shared_ptr<const AppConfig> cfg;
 
     void close_stream() {
         alive.store(false);
@@ -871,6 +907,7 @@ struct UdpInitArgs {
     std::shared_ptr<UdpNatSession> session;
     std::vector<uint8_t> first_payload;
     uint64_t epoch;
+    std::shared_ptr<const AppConfig> cfg;
 };
 
 static std::mutex g_udp_table_mtx;
@@ -887,17 +924,19 @@ static unsigned __stdcall udp_session_worker(void* arg) {
     auto sess = args->session;
     std::vector<uint8_t> first_data = std::move(args->first_payload);
     uint64_t epoch = args->epoch;
+    std::shared_ptr<const AppConfig> cfg_sp = args->cfg ? args->cfg : (sess ? sess->cfg : get_active_cfg());
     delete args;
 
-    if (!g_TunnelRun || g_tunnel_epoch.load() != epoch) {
+    if (!g_TunnelRun || g_tunnel_epoch.load() != epoch || !cfg_sp) {
         sess->alive.store(false);
         std::lock_guard<std::mutex> lk(g_udp_table_mtx);
         auto it = g_udp_map.find(sess->session_key);
         if (it != g_udp_map.end() && it->second == sess) g_udp_map.erase(it);
         return 0;
     }
+    const AppConfig& cfg = *cfg_sp;
 
-    ITransportStream* v_stream = dial_vless_transport(false);
+    ITransportStream* v_stream = dial_vless_transport(false, &cfg);
     if (!v_stream) {
         sess->alive.store(false);
         std::lock_guard<std::mutex> lk(g_udp_table_mtx);
@@ -908,16 +947,16 @@ static unsigned __stdcall udp_session_worker(void* arg) {
     v_stream->set_rcv_timeout(2000); // 2s receive timeout to check session expiration without cutting active uploads
 
     std::vector<uint8_t> init_pkt;
-    if (g_active_cfg.outbound_proto == PROTO_TROJAN) {
+    if (cfg.outbound_proto == PROTO_TROJAN) {
         uint8_t req_hdr[128];
-        int req_len = build_trojan_header(req_hdr, 0x03, sess->dst_ip, sess->dst_port, g_active_cfg.trojan_hash_hex);
+        int req_len = build_trojan_header(req_hdr, 0x03, sess->dst_ip, sess->dst_port, cfg.trojan_hash_hex);
         init_pkt.insert(init_pkt.end(), req_hdr, req_hdr + req_len);
         uint8_t udp_buf[2048];
         int u_len = build_trojan_udp_packet(udp_buf, sess->dst_ip, sess->dst_port, first_data.data(), static_cast<uint16_t>(first_data.size()));
         init_pkt.insert(init_pkt.end(), udp_buf, udp_buf + u_len);
     } else {
         uint8_t hdr[128];
-        int hlen = build_vless_header(hdr, 0x02, sess->dst_ip, sess->dst_port, g_active_cfg.vless_uuid, g_active_cfg.vless_flow);
+        int hlen = build_vless_header(hdr, 0x02, sess->dst_ip, sess->dst_port, cfg.vless_uuid, cfg.vless_flow);
         uint16_t flen_net = htons(static_cast<uint16_t>(first_data.size()));
         init_pkt.insert(init_pkt.end(), hdr, hdr + hlen);
         init_pkt.push_back(static_cast<uint8_t>((flen_net >> 8) & 0xFF));
@@ -940,7 +979,7 @@ static unsigned __stdcall udp_session_worker(void* arg) {
         }
     }
 
-    if (g_active_cfg.outbound_proto == PROTO_VLESS) {
+    if (cfg.outbound_proto == PROTO_VLESS) {
         uint8_t v_resp[2];
         if (!v_stream->recv_exact(v_resp, 2)) {
             sess->alive.store(false);
@@ -971,14 +1010,14 @@ static unsigned __stdcall udp_session_worker(void* arg) {
         }
     }
 
-    uint32_t tun_ip_net = inet_addr(g_active_cfg.tun_ip_str);
+    uint32_t tun_ip_net = inet_addr(cfg.tun_ip_str);
     ULONGLONG udp_timeout = (sess->dst_port == htons(53)) ? 5000 : 30000;
     while (g_TunnelRun && sess->alive.load() && g_tunnel_epoch.load() == epoch) {
         uint16_t dlen = 0;
         uint32_t src_ip_resp = sess->dst_ip;
         uint16_t src_port_resp = sess->dst_port;
 
-        if (g_active_cfg.outbound_proto == PROTO_TROJAN) {
+        if (cfg.outbound_proto == PROTO_TROJAN) {
             uint8_t atyp = 0;
             if (!v_stream->recv_exact(&atyp, 1)) {
                 if (WSAGetLastError() == WSAETIMEDOUT && (GetTickCount64() - sess->last_tick < udp_timeout)) continue;
@@ -1068,8 +1107,9 @@ static unsigned __stdcall udp_session_worker(void* arg) {
     return 0;
 }
 
-static void handle_udp_packet(uint16_t src_port_net, uint32_t dst_ip, uint16_t dst_port_net, const uint8_t* payload, uint16_t payload_len) {
-    if (!g_active_cfg.vless_valid) return;
+static void handle_udp_packet(uint16_t src_port_net, uint32_t dst_ip, uint16_t dst_port_net, const uint8_t* payload, uint16_t payload_len, const std::shared_ptr<const AppConfig>& active_cfg) {
+    if (!active_cfg || !active_cfg->vless_valid) return;
+    const AppConfig& cfg = *active_cfg;
     uint16_t lport = ntohs(src_port_net);
     uint64_t key = make_udp_key(src_port_net, dst_ip, dst_port_net);
     std::shared_ptr<UdpNatSession> sess;
@@ -1112,9 +1152,10 @@ static void handle_udp_packet(uint16_t src_port_net, uint32_t dst_ip, uint16_t d
             sess->last_tick = now;
             sess->session_key = key;
             sess->epoch = cur_epoch;
+            sess->cfg = active_cfg;
             g_udp_map[key] = sess;
 
-            UdpInitArgs* args = new UdpInitArgs{ sess, std::vector<uint8_t>(payload, payload + payload_len), cur_epoch };
+            UdpInitArgs* args = new UdpInitArgs{ sess, std::vector<uint8_t>(payload, payload + payload_len), cur_epoch, active_cfg };
             uintptr_t h = _beginthreadex(nullptr, 65536, udp_session_worker, args, 0, nullptr);
             if (h) CloseHandle(reinterpret_cast<HANDLE>(h));
             return;
@@ -1125,7 +1166,7 @@ static void handle_udp_packet(uint16_t src_port_net, uint32_t dst_ip, uint16_t d
         std::lock_guard<std::mutex> lk(sess->stream_mtx);
         if (sess->alive.load() && sess->v_stream) {
             uint8_t buf[2048];
-            if (g_active_cfg.outbound_proto == PROTO_TROJAN) {
+            if (cfg.outbound_proto == PROTO_TROJAN) {
                 if (payload_len + 11 <= sizeof(buf)) {
                     int tlen = build_trojan_udp_packet(buf, sess->dst_ip, sess->dst_port, payload, payload_len);
                     g_TotalTx += payload_len;
@@ -1153,9 +1194,20 @@ static void handle_udp_packet(uint16_t src_port_net, uint32_t dst_ip, uint16_t d
     }
 }
 
+struct TcpListenerArgs {
+    SOCKET listen_sock;
+    uint64_t epoch;
+    std::shared_ptr<const AppConfig> cfg;
+};
+
 static unsigned __stdcall tcp_listener_thread(void* arg) {
-    SOCKET listen_sock = reinterpret_cast<SOCKET>(arg);
-    while (g_TunnelRun) {
+    TcpListenerArgs* targs = static_cast<TcpListenerArgs*>(arg);
+    SOCKET listen_sock = targs->listen_sock;
+    uint64_t epoch = targs->epoch;
+    std::shared_ptr<const AppConfig> cfg = targs->cfg;
+    delete targs;
+
+    while (g_TunnelRun && g_tunnel_epoch.load() == epoch) {
         sockaddr_in client_addr{}; int addr_len = sizeof(client_addr);
         SOCKET c_sock = accept(listen_sock, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
         if (c_sock == INVALID_SOCKET) break;
@@ -1166,7 +1218,7 @@ static unsigned __stdcall tcp_listener_thread(void* arg) {
             closesocket(c_sock); continue;
         }
         log_msg("tcp_listener: ACCEPT port %u -> target %s:%u", c_port, mask_ip(entry.orig_dst_ip).c_str(), ntohs(entry.orig_dst_port));
-        uintptr_t h = _beginthreadex(nullptr, 65536, tcp_session_thread, new SessionArgs{ c_sock, entry.orig_dst_ip, entry.orig_dst_port, g_tunnel_epoch.load() }, 0, nullptr);
+        uintptr_t h = _beginthreadex(nullptr, 65536, tcp_session_thread, new SessionArgs{ c_sock, entry.orig_dst_ip, entry.orig_dst_port, epoch, cfg }, 0, nullptr);
         if (h) CloseHandle(reinterpret_cast<HANDLE>(h));
     }
     return 0;
@@ -1328,10 +1380,29 @@ void trigger_async_ping() {
 
 static HANDLE g_hMasterThread = nullptr;
 static std::mutex g_master_thread_mtx;
+static std::atomic<bool> g_stop_in_progress{ false };
 
 void stop_tunnel(bool is_failure, const std::string& fail_msg) {
     g_tunnel_epoch.fetch_add(1);
     g_TunnelRun = false;
+
+    DWORD cur_tid = GetCurrentThreadId();
+    DWORD master_tid = g_master_thread_id.load();
+
+    if (cur_tid == master_tid && g_stop_in_progress.load()) {
+        return;
+    }
+
+    bool expected_stop = false;
+    if (!g_stop_in_progress.compare_exchange_strong(expected_stop, true)) {
+        if (cur_tid == master_tid) return;
+        while (g_stop_in_progress.load()) Sleep(10);
+        return;
+    }
+    struct StopGuard {
+        ~StopGuard() { g_stop_in_progress.store(false); }
+    } stop_guard;
+
     log_msg("Stopping tunnel... (is_failure=%d)", is_failure);
     if (g_ListenSock != INVALID_SOCKET) { closesocket(g_ListenSock); g_ListenSock = INVALID_SOCKET; }
 
@@ -1347,14 +1418,17 @@ void stop_tunnel(bool is_failure, const std::string& fail_msg) {
     native_delete_route(g_TunLuid, g_TunIfIndex, "1.1.1.1", 32, "10.66.66.2");
     native_delete_route(g_TunLuid, g_TunIfIndex, "8.8.8.8", 32, "10.66.66.2");
 
-    NET_LUID zero_luid{};
-    std::string v_ip = g_active_cfg.vless_resolved_ip.empty() ? resolve_to_ip_str(g_active_cfg.vless_ip) : g_active_cfg.vless_resolved_ip;
-    if (!v_ip.empty()) {
-        native_delete_route(zero_luid, g_PhysIfIndex, v_ip.c_str(), 32, g_PhysGateway.c_str());
-    }
-    std::string c_ip = g_active_cfg.chain_resolved_ip.empty() ? resolve_to_ip_str(g_active_cfg.chain_ip) : g_active_cfg.chain_resolved_ip;
-    if (!c_ip.empty()) {
-        native_delete_route(zero_luid, g_PhysIfIndex, c_ip.c_str(), 32, g_PhysGateway.c_str());
+    auto active_cfg = get_active_cfg();
+    if (active_cfg) {
+        NET_LUID zero_luid{};
+        std::string v_ip = active_cfg->vless_resolved_ip.empty() ? resolve_to_ip_str(active_cfg->vless_ip) : active_cfg->vless_resolved_ip;
+        if (!v_ip.empty()) {
+            native_delete_route(zero_luid, g_PhysIfIndex, v_ip.c_str(), 32, g_PhysGateway.c_str());
+        }
+        std::string c_ip = active_cfg->chain_resolved_ip.empty() ? resolve_to_ip_str(active_cfg->chain_ip) : active_cfg->chain_resolved_ip;
+        if (!c_ip.empty()) {
+            native_delete_route(zero_luid, g_PhysIfIndex, c_ip.c_str(), 32, g_PhysGateway.c_str());
+        }
     }
 
     {
@@ -1385,8 +1459,6 @@ void stop_tunnel(bool is_failure, const std::string& fail_msg) {
     if (hClean) CloseHandle(reinterpret_cast<HANDLE>(hClean));
 
     // Wait for packet loop / master thread to exit so g_Session is not accessed concurrently
-    DWORD cur_tid = GetCurrentThreadId();
-    DWORD master_tid = g_master_thread_id.load();
     if (cur_tid != master_tid) {
         HANDLE hMaster = nullptr;
         {
@@ -1438,24 +1510,25 @@ static unsigned __stdcall tunnel_master_thread(void*) {
         }
     } master_guard;
 
+    auto active_cfg = std::make_shared<AppConfig>();
     {
         std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
-        g_active_cfg = g_cfg;
+        *active_cfg = g_cfg;
     }
-    g_active_cfg.vless_resolved_ip = resolve_to_ip_str(g_active_cfg.vless_ip);
-    g_active_cfg.chain_resolved_ip = resolve_to_ip_str(g_active_cfg.chain_ip);
+    active_cfg->vless_resolved_ip = resolve_to_ip_str(active_cfg->vless_ip);
+    active_cfg->chain_resolved_ip = resolve_to_ip_str(active_cfg->chain_ip);
 
-    bool has_proxy = (g_active_cfg.chain_type != CHAIN_NONE && !g_active_cfg.chain_ip.empty() && g_active_cfg.chain_port != 0);
-    if (!g_active_cfg.vless_valid && !has_proxy) {
+    bool has_proxy = (active_cfg->chain_type != CHAIN_NONE && !active_cfg->chain_ip.empty() && active_cfg->chain_port != 0);
+    if (!active_cfg->vless_valid && !has_proxy) {
         stop_tunnel(false);
         set_status_msg("Error: Configure a VLESS server or an Upstream Proxy");
         return 0;
     }
-    if (g_active_cfg.chain_type != CHAIN_NONE && (g_active_cfg.chain_ip.empty() || g_active_cfg.chain_port == 0)) {
-        if (g_active_cfg.chain_addr_str.empty()) {
-            if (g_active_cfg.vless_valid) {
+    if (active_cfg->chain_type != CHAIN_NONE && (active_cfg->chain_ip.empty() || active_cfg->chain_port == 0)) {
+        if (active_cfg->chain_addr_str.empty()) {
+            if (active_cfg->vless_valid) {
                 log_msg("Upstream proxy mode selected but address is empty -> Auto-falling back to Direct.");
-                g_active_cfg.chain_type = CHAIN_NONE;
+                active_cfg->chain_type = CHAIN_NONE;
                 {
                     std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
                     g_cfg.chain_type = CHAIN_NONE;
@@ -1467,11 +1540,12 @@ static unsigned __stdcall tunnel_master_thread(void*) {
                 return 0;
             }
         } else {
-            log_msg("Cannot start tunnel: Invalid upstream proxy address '%s'", g_active_cfg.chain_addr_str.c_str());
+            log_msg("Cannot start tunnel: Invalid upstream proxy address '%s'", active_cfg->chain_addr_str.c_str());
             stop_tunnel(true, "Invalid upstream proxy host:port");
             return 0;
         }
     }
+    set_active_cfg(active_cfg);
     g_State = STATE_CONNECTING;
     set_status_msg("Detecting physical interface & loading Wintun...");
     update_tray_icon(); request_flyout_repaint();
@@ -1549,7 +1623,7 @@ static unsigned __stdcall tunnel_master_thread(void*) {
     InitializeUnicastIpAddressEntry(&ip_row);
     ip_row.InterfaceLuid = g_TunLuid;
     ip_row.Address.Ipv4.sin_family = AF_INET;
-    ip_row.Address.Ipv4.sin_addr.s_addr = inet_addr(g_active_cfg.tun_ip_str);
+    ip_row.Address.Ipv4.sin_addr.s_addr = inet_addr(active_cfg->tun_ip_str);
     ip_row.OnLinkPrefixLength = 24;
     ip_row.DadState = IpDadStatePreferred;
     DWORD ip_res = CreateUnicastIpAddressEntry(&ip_row);
@@ -1600,8 +1674,8 @@ static unsigned __stdcall tunnel_master_thread(void*) {
     int listen_buf = 262144;
     setsockopt(g_ListenSock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&listen_buf), sizeof(listen_buf));
     sockaddr_in laddr{}; laddr.sin_family = AF_INET;
-    laddr.sin_addr.s_addr = inet_addr(g_active_cfg.tun_ip_str);
-    laddr.sin_port = htons(g_active_cfg.relay_port);
+    laddr.sin_addr.s_addr = inet_addr(active_cfg->tun_ip_str);
+    laddr.sin_port = htons(active_cfg->relay_port);
     if (bind(g_ListenSock, reinterpret_cast<sockaddr*>(&laddr), sizeof(laddr)) != 0 || listen(g_ListenSock, SOMAXCONN) != 0) {
         log_msg("Failed to bind local NAT listener: WSAError=%d", WSAGetLastError());
         stop_tunnel(true, "Error: Failed to bind local NAT listener");
@@ -1610,17 +1684,17 @@ static unsigned __stdcall tunnel_master_thread(void*) {
 
     if (!g_TunnelRun) { stop_tunnel(false); return 0; }
 
-    uintptr_t hListener = _beginthreadex(nullptr, 65536, tcp_listener_thread, reinterpret_cast<void*>(g_ListenSock), 0, nullptr);
+    uintptr_t hListener = _beginthreadex(nullptr, 65536, tcp_listener_thread, new TcpListenerArgs{ g_ListenSock, my_epoch, active_cfg }, 0, nullptr);
     if (hListener) CloseHandle(reinterpret_cast<HANDLE>(hListener));
 
     // 5. Direct host route bypass for VLESS endpoint & upstream proxy via native IP Helper API (< 1ms)
-    std::string v_ip = g_active_cfg.vless_resolved_ip.empty() ? resolve_to_ip_str(g_active_cfg.vless_ip) : g_active_cfg.vless_resolved_ip;
+    std::string v_ip = active_cfg->vless_resolved_ip.empty() ? resolve_to_ip_str(active_cfg->vless_ip) : active_cfg->vless_resolved_ip;
     if (!g_PhysGateway.empty() && !v_ip.empty()) {
         NET_LUID zero_luid{};
         native_add_route(zero_luid, g_PhysIfIndex, v_ip.c_str(), 32, g_PhysGateway.c_str(), 1);
     }
-    std::string c_ip = g_active_cfg.chain_resolved_ip.empty() ? resolve_to_ip_str(g_active_cfg.chain_ip) : g_active_cfg.chain_resolved_ip;
-    if (!g_PhysGateway.empty() && g_active_cfg.chain_type != CHAIN_NONE && !c_ip.empty()) {
+    std::string c_ip = active_cfg->chain_resolved_ip.empty() ? resolve_to_ip_str(active_cfg->chain_ip) : active_cfg->chain_resolved_ip;
+    if (!g_PhysGateway.empty() && active_cfg->chain_type != CHAIN_NONE && !c_ip.empty()) {
         NET_LUID zero_luid{};
         native_add_route(zero_luid, g_PhysIfIndex, c_ip.c_str(), 32, g_PhysGateway.c_str(), 1);
     }
@@ -1642,18 +1716,18 @@ static unsigned __stdcall tunnel_master_thread(void*) {
     if (is_other_vpn_active()) {
         set_status_msg("Connected - NOTE: Disconnect other VPNs (Throne) to route traffic");
     } else {
-        if (g_active_cfg.vless_valid) {
-            set_status_msg("Connected - Routing all traffic via " + g_active_cfg.vless_remark);
+        if (active_cfg->vless_valid) {
+            set_status_msg("Connected - Routing all traffic via " + active_cfg->vless_remark);
         } else {
-            std::string p_type = (g_active_cfg.chain_type == CHAIN_SOCKS5) ? "SOCKS5" : "HTTP";
-            set_status_msg("Connected - Routing traffic via Upstream " + p_type + " (" + g_active_cfg.chain_ip + ":" + std::to_string(g_active_cfg.chain_port) + ")");
+            std::string p_type = (active_cfg->chain_type == CHAIN_SOCKS5) ? "SOCKS5" : "HTTP";
+            set_status_msg("Connected - Routing traffic via Upstream " + p_type + " (" + active_cfg->chain_ip + ":" + std::to_string(active_cfg->chain_port) + ")");
         }
     }
     log_msg("Tunnel active! Status: %s", get_status_msg().c_str());
     update_tray_icon(); request_flyout_repaint();
 
-    uint32_t tun_ip_net = inet_addr(g_active_cfg.tun_ip_str), tun_peer_net = inet_addr(g_active_cfg.tun_peer_str);
-    uint16_t relay_port_net = htons(g_active_cfg.relay_port);
+    uint32_t tun_ip_net = inet_addr(active_cfg->tun_ip_str), tun_peer_net = inet_addr(active_cfg->tun_peer_str);
+    uint16_t relay_port_net = htons(active_cfg->relay_port);
     HANDLE wait_event = WintunGetReadWaitEvent(g_Session);
 
     while (g_TunnelRun) {
@@ -1706,7 +1780,7 @@ static unsigned __stdcall tunnel_master_thread(void*) {
                     if (ulen > 0 && ulen <= 1400) {
                         if (g_active_dns_workers.load() < 16) {
                             g_active_dns_workers.fetch_add(1);
-                            DnsJob* job = new DnsJob{ ip->saddr, ip->daddr, udp->source, udp->dest, static_cast<uint16_t>(ulen), {} };
+                            DnsJob* job = new DnsJob{ ip->saddr, ip->daddr, udp->source, udp->dest, static_cast<uint16_t>(ulen), active_cfg, {} };
                             std::memcpy(job->payload, pkt + ihl + sizeof(UDPHeader), ulen);
                             uintptr_t hDns = _beginthreadex(nullptr, 65536, dns_hijack_worker, job, 0, nullptr);
                             if (hDns) {
@@ -1720,7 +1794,7 @@ static unsigned __stdcall tunnel_master_thread(void*) {
                 } else if (ip->saddr == tun_ip_net) {
                     int ulen = pkt_size - (ihl + sizeof(UDPHeader));
                     if (ulen > 0 && ulen <= 1460) {
-                        handle_udp_packet(udp->source, ip->daddr, udp->dest, pkt + ihl + sizeof(UDPHeader), static_cast<uint16_t>(ulen));
+                        handle_udp_packet(udp->source, ip->daddr, udp->dest, pkt + ihl + sizeof(UDPHeader), static_cast<uint16_t>(ulen), active_cfg);
                     }
                 }
             }
@@ -1737,8 +1811,28 @@ static unsigned __stdcall tunnel_master_thread(void*) {
 
 void start_tunnel_async() {
     if (g_State.load() == STATE_CONNECTED || g_State.load() == STATE_CONNECTING) return;
+
+    // If a previous master thread is still terminating, wait up to 2000ms for it to exit cleanly
+    {
+        HANDLE hWait = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_master_thread_mtx);
+            if (g_hMasterThread) {
+                DuplicateHandle(GetCurrentProcess(), g_hMasterThread, GetCurrentProcess(), &hWait, SYNCHRONIZE, FALSE, 0);
+            }
+        }
+        if (hWait) {
+            set_status_msg("Waiting for previous tunnel to stop...");
+            WaitForSingleObject(hWait, 2000);
+            CloseHandle(hWait);
+        }
+    }
+
     bool expected = false;
-    if (!g_StartingTunnel.compare_exchange_strong(expected, true)) return;
+    if (!g_StartingTunnel.compare_exchange_strong(expected, true)) {
+        set_status_msg("Tunnel is stopping or starting, please try again");
+        return;
+    }
     g_tunnel_epoch.fetch_add(1);
     g_TunnelRun = true;
     std::lock_guard<std::mutex> lk(g_master_thread_mtx);

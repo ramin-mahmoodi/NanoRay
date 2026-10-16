@@ -1,0 +1,15 @@
+#include <windows.h>
+1 RT_MANIFEST "app.manifest"
+1 ICON "app.ico"
+101 ICON "icon_idle.ico"
+102 ICON "icon_pending.ico"
+103 ICON "icon_conn.ico"
+200 RCDATA "logo.png"
+
+301 RCDATA "fonts/Manrope-ExtraBold.ttf"
+302 RCDATA "fonts/Manrope-Bold.ttf"
+303 RCDATA "fonts/Manrope-SemiBold.ttf"
+304 RCDATA "fonts/Manrope-Medium.ttf"
+305 RCDATA "fonts/JetBrainsMono-Regular.ttf"
+306 RCDATA "fonts/JetBrainsMono-Medium.ttf"
+307 RCDATA "fonts/JetBrainsMono-Bold.ttf"

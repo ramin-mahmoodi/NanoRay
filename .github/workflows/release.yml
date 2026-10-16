@@ -32,8 +32,8 @@ jobs:
       - name: Compile Windows Resources
         run: windres resources/resource.rc -O coff -o resource.o
 
-      - name: Build NanoRay (Pure C++ / MinGW)
-        run: g++ -O3 -s -std=c++17 -D_WIN32_WINNT=0x0A00 -DNOMINMAX -Isrc src/main.cpp src/config.cpp src/tunnel.cpp src/ui_flyout.cpp resource.o -o NanoRay.exe -lws2_32 -liphlpapi -lgdiplus -ldwmapi -lshell32 -lpsapi -lole32 -lgdi32 -luser32 -lwinhttp -lsecur32 -lcrypt32 -lbcrypt -mwindows
+      - name: Build NanoRay (Pure C++ / MinGW Static)
+        run: g++ -O3 -s -std=c++17 -D_WIN32_WINNT=0x0A00 -DNOMINMAX -Isrc src/main.cpp src/config.cpp src/tunnel.cpp src/ui_flyout.cpp resource.o -o NanoRay.exe -static -static-libgcc -static-libstdc++ -lws2_32 -liphlpapi -lgdiplus -ldwmapi -lshell32 -lpsapi -lole32 -lgdi32 -luser32 -lwinhttp -lsecur32 -lcrypt32 -lbcrypt -mwindows
 
       - name: Download official signed Wintun driver (x64)
         shell: pwsh

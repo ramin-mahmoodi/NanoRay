@@ -52,7 +52,12 @@ struct AppConfig {
     bool        is_dark_mode   = true;
 };
 
+#include <mutex>
+
 extern AppConfig g_cfg;
+extern std::recursive_mutex g_cfg_mtx;
+
+AppConfig get_config_snapshot();
 
 bool parse_vless_uri(const std::string& uri_in);
 void sync_chain_fields();

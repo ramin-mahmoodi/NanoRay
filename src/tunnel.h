@@ -26,14 +26,14 @@ std::string get_status_msg();
 
 void run_silent_cmd(const std::string& cmd);
 void start_tunnel_async();
-void stop_tunnel();
+void stop_tunnel(bool is_failure = false, const std::string& fail_msg = "");
 void trigger_async_ping();
 
-inline int build_vless_header(uint8_t* out, uint8_t cmd, uint32_t dst_ip_net, uint16_t dst_port_net) {
+inline int build_vless_header(uint8_t* out, uint8_t cmd, uint32_t dst_ip_net, uint16_t dst_port_net, const uint8_t uuid[16], const std::string& flow) {
     out[0] = 0x00;
-    std::memcpy(out + 1, g_cfg.vless_uuid, 16);
+    std::memcpy(out + 1, uuid, 16);
     int off = 17;
-    if (g_cfg.vless_flow == "xtls-rprx-vision") {
+    if (flow == "xtls-rprx-vision") {
         out[off++] = 0x12; // Addons length = 18 bytes
         out[off++] = 0x0A; // Protobuf Tag: Field 1 (Flow), Wire type 2 (string)
         out[off++] = 0x10; // Length: 16 bytes
@@ -49,11 +49,15 @@ inline int build_vless_header(uint8_t* out, uint8_t cmd, uint32_t dst_ip_net, ui
     return off;
 }
 
-inline int build_vless_header_domain(uint8_t* out, uint8_t cmd, const std::string& domain, uint16_t dst_port_net) {
+inline int build_vless_header(uint8_t* out, uint8_t cmd, uint32_t dst_ip_net, uint16_t dst_port_net) {
+    return build_vless_header(out, cmd, dst_ip_net, dst_port_net, g_cfg.vless_uuid, g_cfg.vless_flow);
+}
+
+inline int build_vless_header_domain(uint8_t* out, uint8_t cmd, const std::string& domain, uint16_t dst_port_net, const uint8_t uuid[16], const std::string& flow) {
     out[0] = 0x00;
-    std::memcpy(out + 1, g_cfg.vless_uuid, 16);
+    std::memcpy(out + 1, uuid, 16);
     int off = 17;
-    if (g_cfg.vless_flow == "xtls-rprx-vision") {
+    if (flow == "xtls-rprx-vision") {
         out[off++] = 0x12; // Addons length = 18 bytes
         out[off++] = 0x0A; // Protobuf Tag: Field 1 (Flow), Wire type 2 (string)
         out[off++] = 0x10; // Length: 16 bytes
@@ -69,6 +73,10 @@ inline int build_vless_header_domain(uint8_t* out, uint8_t cmd, const std::strin
     out[off++] = dlen;
     std::memcpy(out + off, domain.data(), dlen); off += dlen;
     return off;
+}
+
+inline int build_vless_header_domain(uint8_t* out, uint8_t cmd, const std::string& domain, uint16_t dst_port_net) {
+    return build_vless_header_domain(out, cmd, domain, dst_port_net, g_cfg.vless_uuid, g_cfg.vless_flow);
 }
 
 inline int build_trojan_header(uint8_t* out, uint8_t cmd, uint32_t dst_ip_net, uint16_t dst_port_net, const std::string& hex_hash) {

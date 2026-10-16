@@ -124,19 +124,48 @@ public:
 #ifndef SP_PROT_TLS1_3_CLIENT
 #define SP_PROT_TLS1_3_CLIENT 0x00002000
 #endif
-        SCHANNEL_CRED sc{};
-        sc.dwVersion = SCHANNEL_CRED_VERSION;
-        sc.grbitEnabledProtocols = SP_PROT_TLS1_2_CLIENT | SP_PROT_TLS1_3_CLIENT;
-        sc.dwFlags = SCH_CRED_NO_DEFAULT_CREDS;
+#ifndef SCH_CREDENTIALS_VERSION
+#define SCH_CREDENTIALS_VERSION 0x00000005
+#endif
+        TimeStamp tsExpiry{};
+        SECURITY_STATUS status = SEC_E_INTERNAL_ERROR;
+
+        struct NativeSchCredentials {
+            DWORD dwVersion = 5; // SCH_CREDENTIALS_VERSION
+            DWORD dwCredFormat = 0;
+            DWORD cCreds = 0;
+            void** paCred = nullptr;
+            HCERTSTORE hRootStore = nullptr;
+            DWORD cMappers = 0;
+            void** aphMappers = nullptr;
+            DWORD dwSessionLifespan = 0;
+            DWORD dwFlags = 0;
+            DWORD cTlsParameters = 0;
+            void* pTlsParameters = nullptr;
+        } creds;
+        creds.dwFlags = SCH_CRED_NO_DEFAULT_CREDS;
         if (m_allow_insecure) {
-            sc.dwFlags |= SCH_CRED_MANUAL_CRED_VALIDATION | SCH_CRED_IGNORE_NO_REVOCATION_CHECK | SCH_CRED_IGNORE_REVOCATION_OFFLINE;
+            creds.dwFlags |= SCH_CRED_MANUAL_CRED_VALIDATION | SCH_CRED_IGNORE_NO_REVOCATION_CHECK | SCH_CRED_IGNORE_REVOCATION_OFFLINE;
         }
 
-        TimeStamp tsExpiry{};
-        SECURITY_STATUS status = AcquireCredentialsHandleW(
-            nullptr, (SEC_WCHAR*)L"Schannel", SECPKG_CRED_OUTBOUND,
-            nullptr, &sc, nullptr, nullptr, &m_hCred, &tsExpiry);
-        if (status != SEC_E_OK) return false;
+        status = AcquireCredentialsHandleW(
+            nullptr, (SEC_WCHAR*)UNISP_NAME_W, SECPKG_CRED_OUTBOUND,
+            nullptr, &creds, nullptr, nullptr, &m_hCred, &tsExpiry);
+
+        if (status != SEC_E_OK) {
+            SCHANNEL_CRED sc{};
+            sc.dwVersion = SCHANNEL_CRED_VERSION;
+            sc.grbitEnabledProtocols = SP_PROT_TLS1_2_CLIENT | SP_PROT_TLS1_3_CLIENT;
+            sc.dwFlags = SCH_CRED_NO_DEFAULT_CREDS;
+            if (m_allow_insecure) {
+                sc.dwFlags |= SCH_CRED_MANUAL_CRED_VALIDATION | SCH_CRED_IGNORE_NO_REVOCATION_CHECK | SCH_CRED_IGNORE_REVOCATION_OFFLINE;
+            }
+
+            status = AcquireCredentialsHandleW(
+                nullptr, (SEC_WCHAR*)L"Schannel", SECPKG_CRED_OUTBOUND,
+                nullptr, &sc, nullptr, nullptr, &m_hCred, &tsExpiry);
+            if (status != SEC_E_OK) return false;
+        }
         m_cred_valid = true;
 
         std::wstring wsni(m_sni.begin(), m_sni.end());

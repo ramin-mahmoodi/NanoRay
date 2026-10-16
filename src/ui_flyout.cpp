@@ -777,6 +777,7 @@ static void render_flyout_graphics(Graphics& g, float scale, bool is_dark) {
     // Window rounded background (10px radius)
     GraphicsPath win_path;
     add_rounded_rect(win_path, RectF(0.5f, 0.5f, static_cast<float>(PANEL_W) - 1.0f, static_cast<float>(PANEL_H) - 1.0f), 10.0f);
+    std::lock_guard<std::recursive_mutex> lk_cfg(g_cfg_mtx);
     SolidBrush bg_br(theme.bg);
     g.FillPath(&bg_br, &win_path);
     Pen win_border(theme.border, 1.0f);
@@ -1075,24 +1076,24 @@ static void render_flyout_graphics(Graphics& g, float scale, bool is_dark) {
             bool is_vision = (g_cfg.vless_flow == "xtls-rprx-vision");
 
             if (t == "ws") {
-                if (s == "reality") proto_name = is_vision ? base_proto + L" · WS+REALITY+VISION" : base_proto + L" · WS+REALITY";
+                if (s == "reality") proto_name = is_vision ? base_proto + L" · WS+REALITY+VISION (basic)" : base_proto + L" · WS+REALITY";
                 else if (s == "tls") proto_name = base_proto + L" · WS+TLS";
                 else proto_name = base_proto + L" · WS";
             } else if (t == "xhttp") {
-                if (s == "reality") proto_name = is_vision ? base_proto + L" · XHTTP+REALITY+VISION" : base_proto + L" · XHTTP+REALITY";
+                if (s == "reality") proto_name = is_vision ? base_proto + L" · XHTTP+REALITY+VISION (basic)" : base_proto + L" · XHTTP+REALITY";
                 else if (s == "tls") proto_name = base_proto + L" · XHTTP+TLS";
                 else proto_name = base_proto + L" · XHTTP";
             } else if (t == "httpupgrade") {
-                if (s == "reality") proto_name = is_vision ? base_proto + L" · HTTPUPGRADE+REALITY+VISION" : base_proto + L" · HTTPUPGRADE+REALITY";
+                if (s == "reality") proto_name = is_vision ? base_proto + L" · HTTPUPGRADE+REALITY+VISION (basic)" : base_proto + L" · HTTPUPGRADE+REALITY";
                 else if (s == "tls") proto_name = base_proto + L" · HTTPUPGRADE+TLS";
                 else proto_name = base_proto + L" · HTTPUPGRADE";
             } else if (t == "grpc") {
-                if (s == "reality") proto_name = is_vision ? base_proto + L" · GRPC+REALITY+VISION" : base_proto + L" · GRPC+REALITY";
+                if (s == "reality") proto_name = is_vision ? base_proto + L" · GRPC+REALITY+VISION (basic)" : base_proto + L" · GRPC+REALITY";
                 else if (s == "tls") proto_name = base_proto + L" · GRPC+TLS";
                 else proto_name = base_proto + L" · GRPC";
             } else {
-                if (s == "reality") proto_name = is_vision ? base_proto + L" · TCP+REALITY+VISION" : base_proto + L" · TCP+REALITY";
-                else if (s == "tls") proto_name = is_vision ? base_proto + L" · TCP+TLS+VISION" : base_proto + L" · TCP+TLS";
+                if (s == "reality") proto_name = is_vision ? base_proto + L" · TCP+REALITY+VISION (basic)" : base_proto + L" · TCP+REALITY";
+                else if (s == "tls") proto_name = is_vision ? base_proto + L" · TCP+TLS+VISION (basic)" : base_proto + L" · TCP+TLS";
                 else proto_name = base_proto + L" · TCP";
             }
 

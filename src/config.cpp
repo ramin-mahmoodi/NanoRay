@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #include "config.h"
+#include "tunnel.h"
 #include "crypto_reality.h"
 #include <winsock2.h>
 #include <windows.h>
@@ -8,6 +9,12 @@
 #include <cstring>
 
 AppConfig g_cfg;
+std::recursive_mutex g_cfg_mtx;
+
+AppConfig get_config_snapshot() {
+    std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
+    return g_cfg;
+}
 
 static int hex_val(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -49,6 +56,7 @@ static std::string url_decode(const std::string& in) {
 }
 
 bool parse_vless_uri(const std::string& uri_in) {
+    std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
     std::string s = uri_in;
     while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ')) s.pop_back();
     while (!s.empty() && (s.front() == ' ')) s.erase(s.begin());
@@ -177,6 +185,12 @@ bool parse_vless_uri(const std::string& uri_in) {
     if (g_cfg.vless_path.empty()) g_cfg.vless_path = "/";
     if (g_cfg.vless_path.front() != '/') g_cfg.vless_path = "/" + g_cfg.vless_path;
 
+    if (g_cfg.vless_type == "xhttp" && !g_cfg.vless_mode.empty() && g_cfg.vless_mode != "auto" && g_cfg.vless_mode != "stream-up") {
+        g_cfg.vless_valid = false;
+        set_status_msg("Error: Unsupported XHTTP mode '" + g_cfg.vless_mode + "' (only stream-up supported)");
+        return false;
+    }
+
     if (is_vless) std::memcpy(g_cfg.vless_uuid, uuid_tmp, 16);
     g_cfg.vless_ip      = host;
     g_cfg.vless_port    = static_cast<uint16_t>(port);
@@ -187,6 +201,7 @@ bool parse_vless_uri(const std::string& uri_in) {
 }
 
 void sync_chain_fields() {
+    std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
     std::string a = g_cfg.chain_addr_str;
     while (!a.empty() && a.back() == ' ') a.pop_back();
     size_t cpos = a.rfind(':');
@@ -227,6 +242,7 @@ static std::string get_ini_path() {
 }
 
 void save_config_ini() {
+    std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
     std::string ini = get_ini_path();
     WritePrivateProfileStringA("VLESS", "URI", g_cfg.raw_vless_uri.c_str(), ini.c_str());
     WritePrivateProfileStringA("CHAIN", "Type", std::to_string(static_cast<int>(g_cfg.chain_type)).c_str(), ini.c_str());
@@ -236,6 +252,7 @@ void save_config_ini() {
 }
 
 void load_config_ini() {
+    std::lock_guard<std::recursive_mutex> lk(g_cfg_mtx);
     std::string ini = get_ini_path();
     char buf[8192]{};
     GetPrivateProfileStringA("VLESS", "URI", "", buf, sizeof(buf), ini.c_str());

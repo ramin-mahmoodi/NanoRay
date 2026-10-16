@@ -844,6 +844,8 @@ static void render_flyout_graphics(Graphics& g, float scale, bool is_dark) {
         ULONGLONG now = GetTickCount64();
         float dot_cx = 43.0f, dot_cy = 43.0f, dot_r = 5.0f;
 
+        bool can_connect = g_cfg.vless_valid || (g_cfg.chain_type != CHAIN_NONE && !g_cfg.chain_addr_str.empty());
+
         if (st == STATE_CONNECTED) {
             status_line = L"Connected  " + to_wstr(format_uptime());
             status_col = theme.green;
@@ -870,7 +872,7 @@ static void render_flyout_graphics(Graphics& g, float scale, bool is_dark) {
                 Pen pulse_pen(Color(alpha, 245, 158, 11), 1.8f);
                 g.DrawEllipse(&pulse_pen, dot_cx - ring_r, dot_cy - ring_r, ring_r * 2.0f, ring_r * 2.0f);
             }
-        } else if (st == STATE_FAILED) {
+        } else if (st == STATE_FAILED && can_connect) {
             status_line = g_StatusMsg.empty() ? L"Connection failed" : to_wstr(g_StatusMsg);
             status_col = theme.danger_text;
             dot_col = Color(255, 239, 68, 68); // #ef4444
@@ -914,13 +916,16 @@ static void render_flyout_graphics(Graphics& g, float scale, bool is_dark) {
         else if (p_ms >= 0) swprintf_s(ping_txt, L"%d ms", p_ms);
         else swprintf_s(ping_txt, L"Ping Test");
 
+        Color ping_col = can_connect ? theme.sky : theme.muted;
+        SolidBrush ping_txt_br(ping_col);
+
         RectF ping_bounds;
         g.MeasureString(ping_txt, -1, &f_ping, PointF(0, 0), StringFormat::GenericTypographic(), &ping_bounds);
         float ping_content_w = 14.0f + 7.0f + ping_bounds.Width;
         float ping_start_x = r_ping.X + (r_ping.Width - ping_content_w) / 2.0f;
-        draw_svg_ecg(g, ping_start_x, r_ping.Y + (r_ping.Height - 14.0f) * 0.5f, 14.0f, theme.sky);
+        draw_svg_ecg(g, ping_start_x, r_ping.Y + (r_ping.Height - 14.0f) * 0.5f, 14.0f, ping_col);
         PointF ping_txt_pt(ping_start_x + 21.0f, r_ping.Y + (r_ping.Height - ping_bounds.Height) / 2.0f);
-        g.DrawString(ping_txt, -1, &f_ping, ping_txt_pt, &sky_br);
+        g.DrawString(ping_txt, -1, &f_ping, ping_txt_pt, &ping_txt_br);
 
         // ----------------------------------------------------
         // SECTION 2: MAIN CONNECT BUTTON (Y=62, H=44)
@@ -944,24 +949,24 @@ static void render_flyout_graphics(Graphics& g, float scale, bool is_dark) {
             btn_text = L"CONNECTING...";
             show_power = false;
             show_spinner = true;
-        } else if (st == STATE_FAILED) {
+        } else if (st == STATE_FAILED && can_connect) {
             btn_c1 = Color(255, 185, 28, 28);
             btn_c2 = Color(255, 220, 38, 38);
             btn_border = Color(160, 248, 113, 113);
             btn_text = L"RETRY";
             show_power = false;
             show_retry = true;
+        } else if (!can_connect) {
+            btn_c1 = is_dark ? Color(255, 30, 41, 59) : Color(255, 241, 245, 249);
+            btn_c2 = is_dark ? Color(255, 30, 41, 59) : Color(255, 241, 245, 249);
+            btn_border = is_dark ? Color(255, 51, 65, 85) : Color(255, 226, 232, 240);
+            btn_text = L"CONNECT SYSTEM TUNNEL";
+            show_power = true;
         } else {
             btn_c1 = (g_HoverBtn == 2) ? Color(255, 37, 99, 235) : Color(255, 29, 78, 216);
             btn_c2 = (g_HoverBtn == 2) ? Color(255, 14, 165, 233) : Color(255, 2, 132, 199);
             btn_border = Color(160, 56, 189, 248);
         }
-
-        bool can_connect = g_cfg.vless_valid || (g_cfg.chain_type != CHAIN_NONE && !g_cfg.chain_addr_str.empty());
-        float alpha_mul = can_connect ? 1.0f : 0.45f;
-        btn_c1 = Color(static_cast<BYTE>(btn_c1.GetA() * alpha_mul), btn_c1.GetR(), btn_c1.GetG(), btn_c1.GetB());
-        btn_c2 = Color(static_cast<BYTE>(btn_c2.GetA() * alpha_mul), btn_c2.GetR(), btn_c2.GetG(), btn_c2.GetB());
-        btn_border = Color(static_cast<BYTE>(btn_border.GetA() * alpha_mul), btn_border.GetR(), btn_border.GetG(), btn_border.GetB());
 
         GraphicsPath btn_path;
         add_rounded_rect(btn_path, r_conn, 8.0f);
@@ -973,20 +978,23 @@ static void render_flyout_graphics(Graphics& g, float scale, bool is_dark) {
 
         RectF text_bounds;
         g.MeasureString(btn_text, -1, &f_hero, PointF(0, 0), StringFormat::GenericTypographic(), &text_bounds);
-        float content_w = text_bounds.Width + 26.0f;
+        float icon_w = (show_power || show_spinner || show_retry) ? 26.0f : 0.0f;
+        float content_w = text_bounds.Width + icon_w;
         float start_x = r_conn.X + (r_conn.Width - content_w) / 2.0f;
         float mid_y = r_conn.Y + r_conn.Height / 2.0f;
 
-        SolidBrush white_br(Color(static_cast<BYTE>(255 * alpha_mul), 255, 255, 255));
+        Color btn_txt_color = can_connect ? Color(255, 255, 255, 255) : theme.muted;
+        SolidBrush text_br_conn(btn_txt_color);
+
         if (show_power) {
-            draw_svg_power(g, start_x, mid_y - 8.5f, 17.0f, Color(static_cast<BYTE>(255 * alpha_mul), 255, 255, 255));
+            draw_svg_power(g, start_x, mid_y - 8.5f, 17.0f, btn_txt_color);
         } else if (show_spinner) {
             float spin_angle = std::fmod(static_cast<float>(now), 900.0f) / 900.0f * 360.0f;
             draw_svg_spinner(g, start_x, mid_y - 8.5f, 17.0f, Color(255, 255, 255), spin_angle);
         } else if (show_retry) {
             draw_svg_refresh(g, start_x, mid_y - 8.5f, 17.0f, Color(255, 255, 255), 2.4f);
         }
-        g.DrawString(btn_text, -1, &f_hero, PointF(start_x + 26.0f, mid_y - text_bounds.Height / 2.0f), &white_br);
+        g.DrawString(btn_text, -1, &f_hero, PointF(start_x + icon_w, mid_y - text_bounds.Height / 2.0f), &text_br_conn);
 
         // ----------------------------------------------------
         // SECTION 3: METRICS (DOWNLOAD & UPLOAD CARDS Y=116, H=118)
@@ -1327,6 +1335,13 @@ void show_tray_flyout() {
     else if (g_cfg.chain_type == CHAIN_SOCKS5) g_SegTargetX = g_SegPillX = 143.0f;
     else if (g_cfg.chain_type == CHAIN_HTTP) g_SegTargetX = g_SegPillX = 259.0f;
 
+    bool can_connect = g_cfg.vless_valid || (g_cfg.chain_type != CHAIN_NONE && !g_cfg.chain_addr_str.empty());
+    if (!can_connect && g_State.load() == STATE_FAILED) {
+        g_State = STATE_DISCONNECTED;
+        g_StatusMsg.clear();
+        update_tray_icon();
+    }
+
     SetWindowPos(g_Hwnd, HWND_TOPMOST, x, y, cur_win_w, cur_win_h, SWP_SHOWWINDOW);
     SetForegroundWindow(g_Hwnd);
     SetActiveWindow(g_Hwnd);
@@ -1478,10 +1493,11 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             }
         }
 
+        bool can_connect = g_cfg.vless_valid || (g_cfg.chain_type != CHAIN_NONE && !g_cfg.chain_addr_str.empty());
         int old_h = g_HoverBtn;
         g_HoverBtn = 0;
-        if (pt_in_rect(x, y, R_BTN_PING))             g_HoverBtn = 1;
-        else if (pt_in_rect(x, y, R_BTN_CONNECT))     g_HoverBtn = 2;
+        if (pt_in_rect(x, y, R_BTN_PING) && can_connect)             g_HoverBtn = 1;
+        else if (pt_in_rect(x, y, R_BTN_CONNECT) && (can_connect || g_State.load() == STATE_CONNECTED || g_State.load() == STATE_CONNECTING)) g_HoverBtn = 2;
         else if (pt_in_rect(x, y, R_BTN_PASTE_URI))   g_HoverBtn = 3;
         else if (pt_in_rect(x, y, R_BTN_FLUSHDNS))    g_HoverBtn = 4;
         else if (pt_in_rect(x, y, R_BTN_EXIT))        g_HoverBtn = 6;
@@ -1606,22 +1622,21 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             g_cfg.is_dark_mode = !g_cfg.is_dark_mode;
             save_config_ini();
         } else if (pt_in_rect(x, y, R_BTN_PING)) {
-            g_PressedBtn = 1;
-            g_LastPingMs = PING_TESTING;
-            trigger_async_ping();
+            bool can_connect = g_cfg.vless_valid || (g_cfg.chain_type != CHAIN_NONE && !g_cfg.chain_addr_str.empty());
+            if (can_connect) {
+                g_PressedBtn = 1;
+                g_LastPingMs = PING_TESTING;
+                trigger_async_ping();
+            }
         } else if (pt_in_rect(x, y, R_BTN_CONNECT)) {
-            g_PressedBtn = 2;
             TunnelState cur_st = g_State.load();
             if (cur_st == STATE_CONNECTED || cur_st == STATE_CONNECTING) {
+                g_PressedBtn = 2;
                 stop_tunnel();
             } else {
                 bool can_connect = g_cfg.vless_valid || (g_cfg.chain_type != CHAIN_NONE && !g_cfg.chain_addr_str.empty());
-                if (!can_connect) {
-                    g_StatusMsg = "Enter VLESS/Trojan URI or configure an Upstream Proxy";
-                    g_State = STATE_FAILED;
-                    update_tray_icon();
-                    request_flyout_repaint();
-                } else {
+                if (can_connect) {
+                    g_PressedBtn = 2;
                     if (g_cfg.chain_type != CHAIN_NONE && g_cfg.chain_addr_str.empty()) {
                         g_cfg.chain_type = CHAIN_NONE;
                         g_SegTargetX = 27.0f;
@@ -1634,7 +1649,9 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             g_PressedBtn = 7;
             g_cfg.raw_vless_uri.clear(); g_cfg.vless_valid = false;
             g_CaretPos = g_SelStart = g_SelEnd = g_ScrollOffset = 0;
+            if (g_State.load() == STATE_FAILED) g_State = STATE_DISCONNECTED;
             save_config_ini(); g_StatusMsg = "Server URI cleared";
+            update_tray_icon();
         } else if (pt_in_rect(x, y, R_BTN_PASTE_URI) || (!g_cfg.vless_valid && pt_in_rect(x, y, R_EMPTY_URI))) {
             g_PressedBtn = 3;
             std::string clip = read_clipboard_text(hwnd);

@@ -129,6 +129,33 @@ static bool native_delete_route(NET_LUID luid, DWORD if_index, const char* dest,
     return (res == NO_ERROR);
 }
 
+static bool native_add_route6(NET_LUID luid, DWORD if_index, uint8_t high_byte, uint8_t prefix_len, DWORD metric = 1) {
+    MIB_IPFORWARD_ROW2 r{};
+    InitializeIpForwardEntry(&r);
+    r.InterfaceLuid = luid;
+    if (if_index != 0) r.InterfaceIndex = if_index;
+    r.DestinationPrefix.Prefix.Ipv6.sin6_family = AF_INET6;
+    r.DestinationPrefix.Prefix.Ipv6.sin6_addr.s6_addr[0] = high_byte;
+    r.DestinationPrefix.PrefixLength = prefix_len;
+    r.Metric = metric;
+
+    DeleteIpForwardEntry2(&r);
+    DWORD res = CreateIpForwardEntry2(&r);
+    return (res == NO_ERROR || res == ERROR_OBJECT_ALREADY_EXISTS);
+}
+
+static bool native_delete_route6(NET_LUID luid, DWORD if_index, uint8_t high_byte, uint8_t prefix_len) {
+    MIB_IPFORWARD_ROW2 r{};
+    InitializeIpForwardEntry(&r);
+    r.InterfaceLuid = luid;
+    if (if_index != 0) r.InterfaceIndex = if_index;
+    r.DestinationPrefix.Prefix.Ipv6.sin6_family = AF_INET6;
+    r.DestinationPrefix.Prefix.Ipv6.sin6_addr.s6_addr[0] = high_byte;
+    r.DestinationPrefix.PrefixLength = prefix_len;
+    DWORD res = DeleteIpForwardEntry2(&r);
+    return (res == NO_ERROR);
+}
+
 static bool find_physical_adapter(DWORD& out_if_index, std::string& out_gateway) {
     ULONG buf_len = sizeof(IP_ADAPTER_INFO) * 16;
     IP_ADAPTER_INFO* adapters = static_cast<IP_ADAPTER_INFO*>(std::malloc(buf_len));
@@ -254,18 +281,16 @@ static void log_msg(const char* fmt, ...) {
     std::fclose(f);
 }
 
-void run_silent_cmd(const std::string& cmd) {
-    log_msg("EXEC: %s", cmd.c_str());
-    STARTUPINFOA si{}; PROCESS_INFORMATION pi{};
+static void run_silent_netsh(const std::wstring& args) {
+    wchar_t sys_dir[MAX_PATH];
+    if (!GetSystemDirectoryW(sys_dir, MAX_PATH)) return;
+    std::wstring netsh_exe = std::wstring(sys_dir) + L"\\netsh.exe";
+    std::wstring cmd_line = L"\"" + netsh_exe + L"\" " + args;
+
+    STARTUPINFOW si{}; PROCESS_INFORMATION pi{};
     si.cb = sizeof(si); si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
-    std::string full = "cmd.exe /c " + cmd;
-    if (CreateProcessA(nullptr, &full[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, 5000);
-        DWORD exit_code = 0;
-        GetExitCodeProcess(pi.hProcess, &exit_code);
-        if (exit_code != 0) {
-            log_msg("EXIT CODE %lu: %s", exit_code, cmd.c_str());
-        }
+    if (CreateProcessW(netsh_exe.c_str(), &cmd_line[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 4000);
         CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     }
 }
@@ -1417,6 +1442,8 @@ void stop_tunnel(bool is_failure, const std::string& fail_msg) {
     native_delete_route(g_TunLuid, g_TunIfIndex, "128.0.0.0", 1, "10.66.66.2");
     native_delete_route(g_TunLuid, g_TunIfIndex, "1.1.1.1", 32, "10.66.66.2");
     native_delete_route(g_TunLuid, g_TunIfIndex, "8.8.8.8", 32, "10.66.66.2");
+    native_delete_route6(g_TunLuid, g_TunIfIndex, 0x00, 1);
+    native_delete_route6(g_TunLuid, g_TunIfIndex, 0x80, 1);
 
     auto active_cfg = get_active_cfg();
     if (active_cfg) {
@@ -1440,23 +1467,6 @@ void stop_tunnel(bool is_failure, const std::string& fail_msg) {
         }
         g_udp_map.clear();
     }
-
-    // Clean up firewall rules and IPv6 routes asynchronously to avoid blocking UI flyout thread
-    std::wstring tun_alias = g_TunAlias;
-    uintptr_t hClean = _beginthreadex(nullptr, 65536, [](void* arg) -> unsigned {
-        std::wstring* pAlias = static_cast<std::wstring*>(arg);
-        run_silent_cmd("netsh advfirewall firewall delete rule name=\"NanoRayRelay\"");
-        if (pAlias && !pAlias->empty()) {
-            char del_cmd[512];
-            std::snprintf(del_cmd, sizeof(del_cmd), "netsh interface ipv6 delete route ::/1 \"%ls\"", pAlias->c_str());
-            run_silent_cmd(del_cmd);
-            std::snprintf(del_cmd, sizeof(del_cmd), "netsh interface ipv6 delete route 8000::/1 \"%ls\"", pAlias->c_str());
-            run_silent_cmd(del_cmd);
-        }
-        delete pAlias;
-        return 0;
-    }, new std::wstring(tun_alias), 0, nullptr);
-    if (hClean) CloseHandle(reinterpret_cast<HANDLE>(hClean));
 
     // Wait for packet loop / master thread to exit so g_Session is not accessed concurrently
     if (cur_tid != master_tid) {
@@ -1647,22 +1657,16 @@ static unsigned __stdcall tunnel_master_thread(void*) {
         log_msg("SetIpInterfaceEntry metric=1 success");
     }
 
-    // 3. Asynchronously ensure DNS, firewall rules, and IPv6 leak prevention routes
-    struct AsyncTunArgs { std::wstring alias; };
-    AsyncTunArgs* aargs = new AsyncTunArgs{ g_TunAlias };
+    // 3. Asynchronously ensure DNS on virtual adapter
     uintptr_t hAsync = _beginthreadex(nullptr, 65536, [](void* p) -> unsigned {
-        auto* a = static_cast<AsyncTunArgs*>(p);
-        char cmd[512];
-        std::snprintf(cmd, sizeof(cmd), "netsh interface ip set dns name=\"%ls\" static 1.1.1.1 validate=no", a->alias.c_str());
-        run_silent_cmd(cmd);
-        run_silent_cmd("netsh advfirewall firewall add rule name=\"NanoRayRelay\" dir=in action=allow localip=10.66.66.1 protocol=TCP localport=10888 profile=any");
-        std::snprintf(cmd, sizeof(cmd), "netsh interface ipv6 add route ::/1 \"%ls\" metric=1", a->alias.c_str());
-        run_silent_cmd(cmd);
-        std::snprintf(cmd, sizeof(cmd), "netsh interface ipv6 add route 8000::/1 \"%ls\" metric=1", a->alias.c_str());
-        run_silent_cmd(cmd);
-        delete a;
+        auto* pAlias = static_cast<std::wstring*>(p);
+        if (pAlias && !pAlias->empty()) {
+            std::wstring args = L"interface ip set dns name=\"" + *pAlias + L"\" static 1.1.1.1 validate=no";
+            run_silent_netsh(args);
+        }
+        delete pAlias;
         return 0;
-    }, aargs, 0, nullptr);
+    }, new std::wstring(g_TunAlias), 0, nullptr);
     if (hAsync) CloseHandle(reinterpret_cast<HANDLE>(hAsync));
 
     if (!g_TunnelRun) { stop_tunnel(false); return 0; }
@@ -1706,6 +1710,8 @@ static unsigned __stdcall tunnel_master_thread(void*) {
     native_add_route(g_TunLuid, g_TunIfIndex, "128.0.0.0", 1, "10.66.66.2", 1);
     native_add_route(g_TunLuid, g_TunIfIndex, "1.1.1.1", 32, "10.66.66.2", 1);
     native_add_route(g_TunLuid, g_TunIfIndex, "8.8.8.8", 32, "10.66.66.2", 1);
+    native_add_route6(g_TunLuid, g_TunIfIndex, 0x00, 1, 1);
+    native_add_route6(g_TunLuid, g_TunIfIndex, 0x80, 1, 1);
 
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 

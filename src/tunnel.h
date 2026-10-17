@@ -24,7 +24,6 @@ extern ULONGLONG                g_ConnectTick;
 void set_status_msg(const std::string& msg);
 std::string get_status_msg();
 
-void run_silent_cmd(const std::string& cmd);
 void start_tunnel_async();
 void stop_tunnel(bool is_failure = false, const std::string& fail_msg = "");
 void trigger_async_ping();

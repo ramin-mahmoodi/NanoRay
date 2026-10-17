@@ -1741,7 +1741,6 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         } else if (pt_in_rect(x, y, R_BTN_FLUSHDNS)) {
             g_PressedBtn = 4;
             g_FlushFeedbackTicks = GetTickCount64() + 1500;
-            run_silent_cmd("ipconfig /flushdns");
             HMODULE hDns = LoadLibraryA("dnsapi.dll");
             if (hDns) {
                 typedef BOOL(WINAPI* pDnsFlush)();
